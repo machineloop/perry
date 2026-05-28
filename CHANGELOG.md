@@ -2,6 +2,40 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1038 — fastify: primitive response fast path — copy string bytes directly
+
+`jsvalue_to_response_body` at `crates/perry-stdlib/src/fastify/context.rs:636`
+handled string responses by going through `extract_jsvalue_string`
+→ `String::from_utf8_lossy(bytes).to_string()` → `.into_bytes()` —
+one StringHeader read + one UTF-8 validity scan + one String
+allocation + one rename to `Vec<u8>`. The common case (handler
+returns a plain string, hyper just needs its bytes) doesn't need
+the `String` round-trip: the StringHeader's bytes are already
+valid UTF-8 (Perry NaN-boxed strings invariant) and hyper's body
+writer streams them out unchanged.
+
+In the `if jsv.is_string()` branch, read the StringHeader
+directly: get the pointer via `js_get_string_pointer_unified`,
+compute `byte_len`, build a `Vec` with exact capacity, copy via
+`extend_from_slice`. The original `extract_jsvalue_string` path
+stays as a defensive fallback.
+
+### Validation
+
+- `cargo test --release -p perry-stdlib fastify`: 26/26 passing.
+  The non-string body paths (undefined/null/number/object) are
+  covered by `test_build_response_body`; the string fast path
+  fires only with a real Perry StringHeader and is exercised by
+  the integration benches.
+- Real-app yammer-web-server `/external_ping` 5×15s at -c 10:
+  - PR 3 (v0.5.1037) = 2914.0 rps / p99 6.62 ms
+  - PR 6 (this) = 2931.4 rps / p99 6.86 ms — +0.6% rps, p99
+    within run-to-run jitter. Vs README (10.8 rps / 1003 ms) =
+    271× rps, ~146× lower p99.
+
+PR 6 advanced ahead of PR 4 and PR 5 in workstream order because
+those target routes blocked by the pre-existing SIGSEGV.
+
 ## v0.5.1037 — fastify: index static routes for O(1) lookup
 
 `FastifyApp::match_route` in `crates/perry-stdlib/src/fastify/mod.rs`

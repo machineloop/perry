@@ -637,6 +637,28 @@ pub(crate) unsafe fn jsvalue_to_response_body(value: f64) -> (Vec<u8>, BodyKind)
     let jsv = JSValue::from_bits(value.to_bits());
 
     if jsv.is_string() {
+        // PR 6 fast path: read the StringHeader's bytes directly into
+        // Vec<u8> instead of going through
+        //   extract_jsvalue_string → String::from_utf8_lossy → .to_string()
+        //   → .into_bytes()
+        // The intermediate String allocation + UTF-8 validity scan are
+        // unnecessary — hyper's body just wants bytes, and the response
+        // writer streams them out unchanged. Eliminates one allocation
+        // per text-response request, which on yammer-web-server's
+        // /external_ping hot path is one of the few remaining per-request
+        // allocs after PR 2 mem::take. Bottleneck #1 in
+        // .claude/plans/look-at-the-benchmarks-jazzy-llama.md.
+        let ptr = perry_runtime::js_get_string_pointer_unified(value);
+        if ptr != 0 {
+            let header = ptr as *const StringHeader;
+            let len = (*header).byte_len as usize;
+            let data_ptr = (header as *const u8).add(std::mem::size_of::<StringHeader>());
+            let mut bytes = Vec::with_capacity(len);
+            bytes.extend_from_slice(std::slice::from_raw_parts(data_ptr, len));
+            return (bytes, BodyKind::TextOrJson);
+        }
+        // Fallback to the original path if the unified pointer accessor
+        // returns 0 (defensive — should not happen for is_string()).
         if let Some(s) = extract_jsvalue_string(value) {
             return (s.into_bytes(), BodyKind::TextOrJson);
         }
