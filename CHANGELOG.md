@@ -2,6 +2,15 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1047 — runtime: strict `is_valid_obj_ptr` (close two SIGSEGV sites in object setters)
+
+Tighten `is_valid_obj_ptr` in `crates/perry-runtime/src/object/mod.rs` to consult the arena's `classify_heap_generation` registry: addresses outside any registered heap block now return `HeapGeneration::Unknown` and are rejected before any GC-header dereference. Pre-fix the helper accepted any address in the plausibly-userspace range `(0x1000..0x8000_0000_0000)` — including unmapped pages whose backing arena blocks had been recycled — and the typed-feedback fast path `js_typed_feedback_object_set_field_by_name_fast` would deref a stale pointer (`movzbl -0x8(%rax), %ecx`) and crash.
+
+- **Symptom**: yammer-web-server's PerryTs port crashed reliably at ~13k requests under sustained `-c 10` load (exit 139, no stderr). The observability plugin's `req.startTime = process.hrtime.bigint()` per-request write accumulates entries in the typed-feedback site whose underlying request-object pages have been reclaimed by later GC cycles.
+- **Two crash sites**: the typed-feedback fast path AND the slow fallback `js_object_set_field_by_name` (`field_set_by_name.rs:~260`), which also bypassed the helper. Both readouts now go through the strict variant; without the second fix the crash just moved one level deeper in the same backtrace.
+- **Diagnostics bundled**: env-gated leak + SIGSEGV signal handler in `crates/perry-stdlib/src/fastify/{mod,server}.rs`. `PERRY_FASTIFY_LEAK_DIAG=1` prints handle count + DEFERRED queue depth + VmRSS every 1000 pump-dispatched requests AND installs a `libc::backtrace` SIGSEGV dump. Strictly dormant in production via a `OnceLock<bool>` short-circuit (one atomic load per request when unset).
+- **Verification**: `cargo test --release -p perry-stdlib fastify` 31/31 passing; real-app yammer-web-server 4-route bench beats README baseline on every route AND `/external_ping` single-`-c 10` 60s sustained-load probe completes 263 068 requests at 100% success with zero restarts (pre-fix container crashed at ~30s into the same load). One residual restart event during `/teamsmeeting` traces to a different mimalloc-bookkeeping crash under yammer's cosmic-gcc 6000-entry Set rebuild — solved on the yammer side by caching that Set.
+
 ## v0.5.1046 — node:cluster fork + SO_REUSEPORT (share-nothing multi-core serving)
 
 Implement `node:cluster` so apps can fork share-nothing worker processes that share one listen port — enabling multi-core HTTP serving (e.g. yammer-web-server/PerryTs).

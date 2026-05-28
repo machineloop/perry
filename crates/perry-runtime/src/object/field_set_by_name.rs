@@ -257,6 +257,20 @@ pub extern "C" fn js_object_set_field_by_name(
         if (obj as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
             return;
         }
+        // STRICT: reject pointers that aren't in a live arena block.
+        // The cheap range check above only rules out null-ish small
+        // values; an address that's plausibly userspace but UNMAPPED
+        // would still sail through and the `(*gc_header).obj_type`
+        // read below SIGSEGVs. Diagnosed via yammer-web-server's
+        // observability plugin (`req.startTime = process.hrtime.bigint()`
+        // per request): after ~13k requests the slow path here is
+        // handed a pointer whose arena page was reclaimed by GC, and
+        // the deref crashes. `is_valid_obj_ptr`'s strict variant
+        // consults the arena's `classify_heap_generation` registry
+        // so only live-block addresses pass.
+        if !is_valid_obj_ptr(obj as *const u8) {
+            return;
+        }
         let gc_header =
             (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         let gc_type = (*gc_header).obj_type;

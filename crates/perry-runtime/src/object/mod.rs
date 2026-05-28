@@ -1681,7 +1681,26 @@ pub(crate) fn is_valid_obj_ptr(ptr: *const u8) -> bool {
         target_os = "visionos",
     )))]
     const HEAP_MIN: u64 = 0x200_0000_0000;
-    (HEAP_MIN..0x8000_0000_0000).contains(&addr)
+    if !(HEAP_MIN..0x8000_0000_0000).contains(&addr) {
+        return false;
+    }
+    // STRICT: the range check above only proves `addr` is plausibly a
+    // user-space pointer. Unmapped pages inside the userspace range
+    // sail through it, and `object_shape` / the typed-feedback fast
+    // path then deref `*(addr - 8)` (the GC header) → SIGSEGV under
+    // sustained yammer-web-server load (~13k requests in, observed
+    // when yammer's observability plugin sets `req.startTime =
+    // process.hrtime.bigint()` per request; the typed-feedback site
+    // accumulates entries whose object addresses get reused/unmapped
+    // by later GC cycles, and the next dispatch reads from those
+    // stale page mappings). Require the address to fall inside a
+    // registered heap block — if `classify_heap_generation` returns
+    // `Unknown`, the address isn't backed by a live arena page and
+    // we MUST reject it before any deref.
+    !matches!(
+        crate::arena::classify_heap_generation(addr as usize),
+        crate::arena::HeapGeneration::Unknown,
+    )
 }
 
 /// Object header - precedes the fields in memory

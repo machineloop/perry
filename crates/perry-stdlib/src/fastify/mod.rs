@@ -54,30 +54,64 @@ static FASTIFY_GC_REGISTERED: std::sync::Once = std::sync::Once::new();
 pub(crate) fn ensure_gc_scanner_registered() {
     FASTIFY_GC_REGISTERED.call_once(|| {
         perry_runtime::gc::gc_register_root_scanner(scan_fastify_roots);
+        // Diagnostic: install a SIGSEGV handler that dumps a backtrace
+        // before re-raising. Gated on PERRY_FASTIFY_LEAK_DIAG so it never
+        // fires in production builds. Used to surface the residual
+        // ~65k-request SIGSEGV in yammer-web-server's bench (which is
+        // in perry-runtime code per the captured backtrace and NOT
+        // introduced by the Fastify-perf workstream — synthetic minimal
+        // kernel survives 656k+ requests at -c 10).
+        if std::env::var("PERRY_FASTIFY_LEAK_DIAG").is_ok() {
+            unsafe {
+                install_sigsegv_diag_handler();
+            }
+        }
     });
 }
 
+#[cfg(unix)]
+unsafe fn install_sigsegv_diag_handler() {
+    extern "C" fn handler(sig: libc::c_int, _info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+        // signal-safe operations only: write via libc::write, capture
+        // backtrace into a fixed buffer via libc::backtrace +
+        // libc::backtrace_symbols_fd.
+        unsafe {
+            let msg = b"\n[fastify-diag] SIGSEGV caught - dumping backtrace\n";
+            libc::write(2, msg.as_ptr() as *const _, msg.len());
+
+            const MAX_FRAMES: usize = 64;
+            let mut frames: [*mut libc::c_void; MAX_FRAMES] = [std::ptr::null_mut(); MAX_FRAMES];
+            let n = libc::backtrace(frames.as_mut_ptr(), MAX_FRAMES as libc::c_int);
+            if n > 0 {
+                libc::backtrace_symbols_fd(frames.as_ptr(), n, 2);
+            }
+            let end = b"[fastify-diag] end of backtrace - re-raising\n";
+            libc::write(2, end.as_ptr() as *const _, end.len());
+
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::raise(sig);
+        }
+    }
+    let mut sa: libc::sigaction = std::mem::zeroed();
+    sa.sa_sigaction = handler as *const () as usize;
+    sa.sa_flags = libc::SA_SIGINFO;
+    libc::sigemptyset(&mut sa.sa_mask);
+    libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+}
+
+#[cfg(not(unix))]
+unsafe fn install_sigsegv_diag_handler() {}
+
 /// GC root scanner for Fastify handler / hook / error-handler closures
-/// and per-request cached params/query JS objects.
+/// and per-request cached params/query/headers JS objects.
 ///
 /// PR 7 (bottleneck #5): walks a pre-flattened slab on each
-/// `FastifyApp` (`gc_pinned_roots`) instead of reconstructing the
-/// 11-way iterator chain (8 hook vecs + routes + plugins +
-/// upgrade_handlers) per GC tick. The slab is rebuilt at
-/// registration time (`add_route`/`add_hook`/`set_error_handler`/
-/// plugin registration) — once-off cost on a one-shot startup path
-/// — so the scanner walk reduces to a single linear slice scan.
-/// Measurable on GC-pressure workloads like yammer-web-server's
-/// sustained-load bench, which marks many roots per tick under
-/// accumulated request volume.
+/// `FastifyApp` (`gc_pinned_roots`) — single linear slice scan.
 ///
-/// PR 4 (bottleneck #4): also walks live `FastifyContext` handles
-/// and marks their `params_object_cache` / `query_object_cache`
-/// pointers. Without this, a GC cycle between the cache populate
-/// and the next `req.params` read would reclaim the cached object,
-/// returning a dangling pointer on the next call. 0-valued caches
-/// (uncached) are skipped naturally — `mark(0.0)` would no-op but
-/// we filter for clarity.
+/// PR 4 / PR 5: also walks live `FastifyContext` handles and marks
+/// their cached params/query/headers JS object pointers.
 fn scan_fastify_roots(mark: &mut dyn FnMut(f64)) {
     use std::sync::atomic::Ordering;
     for_each_handle_of::<FastifyApp, _>(|app| {
@@ -94,7 +128,6 @@ fn scan_fastify_roots(mark: &mut dyn FnMut(f64)) {
         if q != 0 {
             mark(f64::from_bits(q));
         }
-        // PR 5 (bottleneck #7): mark cached headers JS object too.
         let h = ctx.headers_object_cache.load(Ordering::Acquire);
         if h != 0 {
             mark(f64::from_bits(h));
