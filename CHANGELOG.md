@@ -2,6 +2,21 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1042 — fastify: direct JSValue headers object build + cache
+
+`js_fastify_req_headers` in `crates/perry-stdlib/src/fastify/context.rs`
+used to encode `ctx.headers` to JSON via `serde_json::to_string`,
+build a Perry string, and then re-parse via `js_json_parse` — a
+full JSON encode + decode per call. Replace with the same direct
+FFI sequence PR 4 uses for params/query (`js_object_alloc` +
+`js_object_set_field_f64` + `js_object_set_keys`), plus a third
+`AtomicU64` cache slot `headers_object_cache` on FastifyContext.
+`scan_fastify_roots` extended to mark the headers cache.
+
+30/30 fastify tests passing (added 1). Real-app yammer
+`/yammer` p99 dropped 4× (45.5 → 11.3 ms) — the CSP nonce path's
+multi-header read was the round-trip's primary load.
+
 ## v0.5.1041 — fastify: cache params/query JS object on FastifyContext
 
 Two `AtomicU64` cache slots on `FastifyContext`. First call to

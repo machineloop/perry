@@ -94,6 +94,11 @@ fn scan_fastify_roots(mark: &mut dyn FnMut(f64)) {
         if q != 0 {
             mark(f64::from_bits(q));
         }
+        // PR 5 (bottleneck #7): mark cached headers JS object too.
+        let h = ctx.headers_object_cache.load(Ordering::Acquire);
+        if h != 0 {
+            mark(f64::from_bits(h));
+        }
     });
 }
 

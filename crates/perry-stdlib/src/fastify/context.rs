@@ -117,6 +117,13 @@ pub struct FastifyContext {
     /// PR 4: cached `req.query` JS object. Same encoding as
     /// params_object_cache.
     pub query_object_cache: std::sync::atomic::AtomicU64,
+    /// PR 5 (bottleneck #7): cached `req.headers` JS object. Same
+    /// encoding as params_object_cache. Headers are read once or
+    /// twice per request in typical yammer-web-server code (CSP
+    /// nonce path reads content-type, host, x-forwarded-for) so
+    /// caching the constructed object after the first read avoids
+    /// rebuilding it for each subsequent read.
+    pub headers_object_cache: std::sync::atomic::AtomicU64,
 }
 
 impl FastifyContext {
@@ -152,6 +159,7 @@ impl FastifyContext {
             user_data: TAG_UNDEFINED,
             params_object_cache: std::sync::atomic::AtomicU64::new(0),
             query_object_cache: std::sync::atomic::AtomicU64::new(0),
+            headers_object_cache: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -435,23 +443,63 @@ pub unsafe extern "C" fn js_fastify_req_json(ctx_handle: Handle) -> f64 {
     f64::from_bits(JSValue::undefined().bits())
 }
 
-/// Get all headers as JSON object
-/// Get all request headers as a JS object (so request.headers.authorization works)
+/// Get all request headers as a JS object.
+///
+/// PR 5 (bottleneck #7): builds the JS object directly via the
+/// runtime's object-creation FFI (`js_object_alloc` +
+/// `js_object_set_field_f64` + `js_object_set_keys`) instead of
+/// going through the previous `serde_json::to_string → js_string_
+/// from_bytes → js_json_parse` round-trip. Removes one full JSON
+/// encode + one full JSON decode per `req.headers` access — the
+/// pattern is identical to PR 4's direct params/query object
+/// construction, just keyed on `ctx.headers` instead of
+/// `ctx.params`.
+///
+/// PR 5 also caches the constructed object in
+/// `headers_object_cache` (same encoding as PR 4's caches: 0 =
+/// uncached, non-zero = NaN-boxed pointer bits). yammer-web-server
+/// CSP nonce path reads several headers per request; the cache
+/// makes the second+ accesses O(1).
 #[no_mangle]
 pub unsafe extern "C" fn js_fastify_req_headers(ctx_handle: Handle) -> i64 {
+    use perry_runtime::{
+        js_array_alloc, js_array_push_f64, js_nanbox_string, js_object_alloc,
+        js_object_set_field_f64, js_object_set_keys,
+    };
+    use std::sync::atomic::Ordering;
+
+    const TAG_UNDEFINED: i64 = 0x7FFC_0000_0000_0001u64 as i64;
+
     if let Some(ctx) = get_handle::<FastifyContext>(ctx_handle) {
-        if let Ok(json) = serde_json::to_string(&ctx.headers) {
-            // Create a Perry string for the JSON
-            let json_ptr = js_string_from_bytes(json.as_ptr(), json.len() as u32);
-            if !json_ptr.is_null() {
-                // Parse the JSON string into a JS object using Perry's JSON parser
-                let jsval_bits = js_json_parse(json_ptr as *const StringHeader);
-                return jsval_bits as i64;
-            }
+        let cached = ctx.headers_object_cache.load(Ordering::Acquire);
+        if cached != 0 {
+            return cached as i64;
         }
+
+        let field_count = ctx.headers.len() as u32;
+        let obj = js_object_alloc(0, field_count);
+        if obj.is_null() {
+            return TAG_UNDEFINED;
+        }
+        let keys_arr = js_array_alloc(field_count);
+        if keys_arr.is_null() {
+            return TAG_UNDEFINED;
+        }
+        for (i, (key, value)) in ctx.headers.iter().enumerate() {
+            let key_ptr = js_string_from_bytes(key.as_ptr(), key.len() as u32);
+            let value_ptr = js_string_from_bytes(value.as_ptr(), value.len() as u32);
+            let key_nanboxed = js_nanbox_string(key_ptr as i64);
+            js_array_push_f64(keys_arr, key_nanboxed);
+            let value_nanboxed = js_nanbox_string(value_ptr as i64);
+            js_object_set_field_f64(obj, i as u32, value_nanboxed);
+        }
+        js_object_set_keys(obj, keys_arr);
+        let ptr = obj as u64;
+        let nan_boxed = 0x7FFD_0000_0000_0000u64 | (ptr & 0x0000_FFFF_FFFF_FFFF);
+        ctx.headers_object_cache.store(nan_boxed, Ordering::Release);
+        return nan_boxed as i64;
     }
-    // Return undefined
-    0x7FFC_0000_0000_0001u64 as i64
+    TAG_UNDEFINED
 }
 
 /// Get a single header value

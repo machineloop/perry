@@ -1449,6 +1449,39 @@ mod tests {
     /// flow takes 1 000 ms per request — observable as `/external_ping`
     /// at 10.7 rps / p99 1004 ms in benchmarks/results/perry/.
     ///
+    /// Regression test for PR 5 (bottleneck #7 — direct JSValue
+    /// headers build + cache). `FastifyContext::headers_object_cache`
+    /// must start at 0 and round-trip through populate/recall the
+    /// same as PR 4's params/query caches. A regression that forgets
+    /// to initialize the field, or stores a stale value across
+    /// requests, would surface here.
+    #[test]
+    fn test_fastify_context_headers_cache_starts_empty() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = FastifyContext::new(
+            7,
+            "GET".to_string(),
+            "/yammer".to_string(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(
+            ctx.headers_object_cache.load(Ordering::Acquire),
+            0,
+            "fresh FastifyContext must have headers_object_cache = 0"
+        );
+
+        let synthetic = 0x7FFD_0000_C0FF_EEEEu64;
+        ctx.headers_object_cache
+            .store(synthetic, Ordering::Release);
+        assert_eq!(
+            ctx.headers_object_cache.load(Ordering::Acquire),
+            synthetic
+        );
+    }
+
     /// Regression test for PR 4 (bottleneck #4 — cached params/query
     /// JS object). FastifyContext gained two AtomicU64 cache slots
     /// (`params_object_cache`, `query_object_cache`); the
