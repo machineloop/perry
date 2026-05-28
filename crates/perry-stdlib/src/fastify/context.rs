@@ -106,6 +106,17 @@ pub struct FastifyContext {
     pub response_body: Option<Vec<u8>>,
     /// User data attached by auth middleware (NaN-boxed JSValue bits)
     pub user_data: u64,
+    /// PR 4 (bottleneck #4): cached `req.params` JS object built on
+    /// first access. 0 means uncached. Cached value is a NaN-boxed
+    /// pointer (top 16 bits = 0x7FFD), so 0 never collides with a
+    /// valid cache entry. AtomicU64 (not Cell) because FastifyContext
+    /// must be Send+Sync for the global DashMap handle registry —
+    /// Cell isn't Sync. Reset by `FastifyContext::new` (each request
+    /// gets a fresh context, no inter-request leak).
+    pub params_object_cache: std::sync::atomic::AtomicU64,
+    /// PR 4: cached `req.query` JS object. Same encoding as
+    /// params_object_cache.
+    pub query_object_cache: std::sync::atomic::AtomicU64,
 }
 
 impl FastifyContext {
@@ -139,6 +150,8 @@ impl FastifyContext {
             sent: false,
             response_body: None,
             user_data: TAG_UNDEFINED,
+            params_object_cache: std::sync::atomic::AtomicU64::new(0),
+            query_object_cache: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -251,15 +264,31 @@ pub unsafe extern "C" fn js_fastify_req_params(ctx_handle: Handle) -> *mut Strin
     std::ptr::null_mut()
 }
 
-/// Get all route params as a JavaScript object (NaN-boxed pointer)
+/// Get all route params as a JavaScript object (NaN-boxed pointer).
+///
+/// PR 4 (bottleneck #4): caches the constructed JS object on the
+/// FastifyContext on first access — subsequent reads return the
+/// cached pointer with no allocation. Per-request invariant: each
+/// new FastifyContext starts with `params_object_cache = 0`, so the
+/// cache is naturally scoped to one request (and dropped along with
+/// the context by PR 1.5's drop_handle at dispatch tail).
 #[no_mangle]
 pub unsafe extern "C" fn js_fastify_req_params_object(ctx_handle: Handle) -> f64 {
     use perry_runtime::{
         js_array_alloc, js_array_push_f64, js_nanbox_string, js_object_alloc,
         js_object_set_field_f64, js_object_set_keys,
     };
+    use std::sync::atomic::Ordering;
 
     if let Some(ctx) = get_handle::<FastifyContext>(ctx_handle) {
+        // Fast path: cached pointer from a prior call in the same
+        // request. 0 means uncached; valid cache entries are NaN-boxed
+        // pointers (top 16 bits = 0x7FFD) so 0 never collides.
+        let cached = ctx.params_object_cache.load(Ordering::Acquire);
+        if cached != 0 {
+            return f64::from_bits(cached);
+        }
+
         let field_count = ctx.params.len() as u32;
         let obj = js_object_alloc(0, field_count);
         if obj.is_null() {
@@ -279,7 +308,12 @@ pub unsafe extern "C" fn js_fastify_req_params_object(ctx_handle: Handle) -> f64
         }
         js_object_set_keys(obj, keys_arr);
         let ptr = obj as u64;
-        return f64::from_bits(0x7FFD_0000_0000_0000 | (ptr & 0x0000_FFFF_FFFF_FFFF));
+        let nan_boxed = 0x7FFD_0000_0000_0000u64 | (ptr & 0x0000_FFFF_FFFF_FFFF);
+        // Cache for the rest of the request lifetime. Release so any
+        // subsequent Acquire load on this same context sees the
+        // populated bits.
+        ctx.params_object_cache.store(nan_boxed, Ordering::Release);
+        return f64::from_bits(nan_boxed);
     }
     f64::from_bits(0x7FFC_0000_0000_0001)
 }
@@ -312,15 +346,26 @@ pub unsafe extern "C" fn js_fastify_req_query(ctx_handle: Handle) -> *mut String
     std::ptr::null_mut()
 }
 
-/// Get all query params as a JavaScript object (NaN-boxed pointer)
+/// Get all query params as a JavaScript object (NaN-boxed pointer).
+///
+/// PR 4 (bottleneck #4): caches on first access via
+/// `query_object_cache`. Same encoding as
+/// `js_fastify_req_params_object` — 0 means uncached, non-zero is
+/// the NaN-boxed pointer bits (top 16 = 0x7FFD).
 #[no_mangle]
 pub unsafe extern "C" fn js_fastify_req_query_object(ctx_handle: Handle) -> f64 {
     use perry_runtime::{
         js_array_alloc, js_array_push_f64, js_nanbox_string, js_object_alloc,
         js_object_set_field_f64, js_object_set_keys,
     };
+    use std::sync::atomic::Ordering;
 
     if let Some(ctx) = get_handle::<FastifyContext>(ctx_handle) {
+        let cached = ctx.query_object_cache.load(Ordering::Acquire);
+        if cached != 0 {
+            return f64::from_bits(cached);
+        }
+
         let params = ctx.get_query_params();
         let field_count = params.len() as u32;
 
@@ -357,7 +402,10 @@ pub unsafe extern "C" fn js_fastify_req_query_object(ctx_handle: Handle) -> f64 
 
         // Return NaN-boxed pointer
         let ptr = obj as u64;
-        return f64::from_bits(0x7FFD_0000_0000_0000 | (ptr & 0x0000_FFFF_FFFF_FFFF));
+        let nan_boxed = 0x7FFD_0000_0000_0000u64 | (ptr & 0x0000_FFFF_FFFF_FFFF);
+        // PR 4 cache write — see params accessor above for invariant.
+        ctx.query_object_cache.store(nan_boxed, Ordering::Release);
+        return f64::from_bits(nan_boxed);
     }
 
     f64::from_bits(0x7FFC_0000_0000_0001) // undefined

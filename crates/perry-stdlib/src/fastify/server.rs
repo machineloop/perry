@@ -1449,6 +1449,53 @@ mod tests {
     /// flow takes 1 000 ms per request — observable as `/external_ping`
     /// at 10.7 rps / p99 1004 ms in benchmarks/results/perry/.
     ///
+    /// Regression test for PR 4 (bottleneck #4 — cached params/query
+    /// JS object). FastifyContext gained two AtomicU64 cache slots
+    /// (`params_object_cache`, `query_object_cache`); the
+    /// `js_fastify_req_params_object` / `_query_object` accessors
+    /// store the constructed NaN-boxed pointer on first build and
+    /// return it on subsequent calls. The invariant this test
+    /// guards: a fresh context starts with both caches at 0
+    /// (uncached). A regression that re-initializes them to a
+    /// non-zero stale value would surface here.
+    ///
+    /// The full populate-then-recall path needs the perry runtime
+    /// (js_object_alloc etc.) — exercised by the synthetic + real-app
+    /// integration benches.
+    #[test]
+    fn test_fastify_context_params_query_cache_starts_empty() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = FastifyContext::new(
+            7,
+            "GET".to_string(),
+            "/users/:id".to_string(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(
+            ctx.params_object_cache.load(Ordering::Acquire),
+            0,
+            "fresh FastifyContext must have params_object_cache = 0"
+        );
+        assert_eq!(
+            ctx.query_object_cache.load(Ordering::Acquire),
+            0,
+            "fresh FastifyContext must have query_object_cache = 0"
+        );
+
+        // Simulate the accessor's first-build store and verify the
+        // load round-trips correctly.
+        let synthetic_nan_boxed = 0x7FFD_0000_DEAD_BEEFu64;
+        ctx.params_object_cache
+            .store(synthetic_nan_boxed, Ordering::Release);
+        assert_eq!(
+            ctx.params_object_cache.load(Ordering::Acquire),
+            synthetic_nan_boxed
+        );
+    }
+
     /// Regression test for PR 1.5 (sustained-load SIGSEGV root cause —
     /// FastifyContext handle leak). Per request the dispatcher used to
     /// call `register_handle(ctx)` without ever calling `drop_handle`

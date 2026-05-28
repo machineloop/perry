@@ -57,7 +57,8 @@ pub(crate) fn ensure_gc_scanner_registered() {
     });
 }
 
-/// GC root scanner for Fastify handler / hook / error-handler closures.
+/// GC root scanner for Fastify handler / hook / error-handler closures
+/// and per-request cached params/query JS objects.
 ///
 /// PR 7 (bottleneck #5): walks a pre-flattened slab on each
 /// `FastifyApp` (`gc_pinned_roots`) instead of reconstructing the
@@ -69,10 +70,29 @@ pub(crate) fn ensure_gc_scanner_registered() {
 /// Measurable on GC-pressure workloads like yammer-web-server's
 /// sustained-load bench, which marks many roots per tick under
 /// accumulated request volume.
+///
+/// PR 4 (bottleneck #4): also walks live `FastifyContext` handles
+/// and marks their `params_object_cache` / `query_object_cache`
+/// pointers. Without this, a GC cycle between the cache populate
+/// and the next `req.params` read would reclaim the cached object,
+/// returning a dangling pointer on the next call. 0-valued caches
+/// (uncached) are skipped naturally — `mark(0.0)` would no-op but
+/// we filter for clarity.
 fn scan_fastify_roots(mark: &mut dyn FnMut(f64)) {
+    use std::sync::atomic::Ordering;
     for_each_handle_of::<FastifyApp, _>(|app| {
         for bits in app.gc_pinned_roots.iter() {
             mark(f64::from_bits(*bits));
+        }
+    });
+    for_each_handle_of::<crate::fastify::FastifyContext, _>(|ctx| {
+        let p = ctx.params_object_cache.load(Ordering::Acquire);
+        if p != 0 {
+            mark(f64::from_bits(p));
+        }
+        let q = ctx.query_object_cache.load(Ordering::Acquire);
+        if q != 0 {
+            mark(f64::from_bits(q));
         }
     });
 }

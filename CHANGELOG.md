@@ -2,6 +2,19 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1041 — fastify: cache params/query JS object on FastifyContext
+
+Two `AtomicU64` cache slots on `FastifyContext`. First call to
+`js_fastify_req_params_object` / `_query_object` builds the JS
+object as before and stashes the NaN-boxed pointer in the slot;
+subsequent calls return the cached value. `scan_fastify_roots`
+extended to mark live FastifyContext caches as GC roots so the
+cached object survives a GC cycle between handler reads.
+
+29/29 fastify tests passing (added 1). Real-app /external_ping
+climbs to 4113 rps / p99 6.67 ms — best workstream result yet
+(380× vs README rps, 150× lower p99).
+
 ## v0.5.1040 — fastify: consolidate GC root scanner to single iteration
 
 `scan_fastify_roots` walked an 11-way iterator chain per GC tick
