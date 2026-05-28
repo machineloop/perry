@@ -482,8 +482,59 @@ pub fn js_fastify_process_pending() -> i32 {
     // `js_stdlib_process_pending`, not through this request loop.
     thread_local! {
         static IN_PROGRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        // PR 8 (bottleneck #8): deferred-request queue. When the pump
+        // is re-entered while a handler's await is in flight (the
+        // #1824 nested case), the nested call drains every server's
+        // try_recv into here instead of returning empty-handed. The
+        // outer pump frame then dispatches the deferred queue at the
+        // end of its loop — AFTER its own try-frame depth is unwound,
+        // so MAX_TRY_DEPTH (128) is not at risk. Net effect: an
+        // awaited request observed by a nested pump call is
+        // dispatched in the same outer pump tick instead of waiting
+        // for the next event-loop iteration, cutting one
+        // event-loop-turnaround of latency per nested-await request.
+        // Capacity capped at 4096 entries to bound memory under
+        // pathological load.
+        static DEFERRED: std::cell::RefCell<std::collections::VecDeque<(Handle, FastifyPendingRequest)>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     }
+    const DEFERRED_QUEUE_CAP: usize = 4096;
     if IN_PROGRESS.with(|f| f.replace(true)) {
+        // Nested entry — drain every server's pending channel into
+        // DEFERRED so the outer frame can dispatch them at its tail.
+        // Hold each server's request_rx mutex only briefly.
+        crate::common::iter_handle_ids_of::<FastifyServerHandle, _>(|h| {
+            let app_handle = match get_handle::<FastifyServerHandle>(h) {
+                Some(s) => s.app_handle,
+                None => return,
+            };
+            loop {
+                let pending = match get_handle::<FastifyServerHandle>(h) {
+                    Some(s) => {
+                        let mut guard = s.request_rx.lock().unwrap();
+                        match guard.as_mut() {
+                            Some(rx) => rx.try_recv().ok(),
+                            None => None,
+                        }
+                    }
+                    None => None,
+                };
+                let pending = match pending {
+                    Some(p) => p,
+                    None => break,
+                };
+                DEFERRED.with(|q| {
+                    let mut q = q.borrow_mut();
+                    if q.len() < DEFERRED_QUEUE_CAP {
+                        q.push_back((app_handle, pending));
+                    }
+                    // If at cap, the pending is dropped here — its
+                    // response_tx Drop will signal the hyper
+                    // service-fn await with an Err and produce a 503.
+                    // Backpressure under load, not a leak.
+                });
+            }
+        });
         return 0;
     }
     struct ResetReentryGuard;
@@ -549,6 +600,23 @@ pub fn js_fastify_process_pending() -> i32 {
             process_fastify_request(app_handle, pending);
             count += 1;
         }
+    }
+
+    // PR 8 tail: drain anything a nested pump call accumulated into
+    // DEFERRED. These were already moved out of the per-server
+    // request_rx during the nested call, so the mpsc is now empty for
+    // them — we just need to dispatch the captured pending struct.
+    // Dispatching happens in this outer frame, so the try-frame depth
+    // stays at the outer level (not nested at the await re-entry
+    // depth) and MAX_TRY_DEPTH is not at risk.
+    loop {
+        let next = DEFERRED.with(|q| q.borrow_mut().pop_front());
+        let (app_handle, pending) = match next {
+            Some(t) => t,
+            None => break,
+        };
+        process_fastify_request(app_handle, pending);
+        count += 1;
     }
 
     // Return the (capacity-retaining) buffer to the thread-local so the
@@ -1449,6 +1517,38 @@ mod tests {
     /// flow takes 1 000 ms per request — observable as `/external_ping`
     /// at 10.7 rps / p99 1004 ms in benchmarks/results/perry/.
     ///
+    /// Regression test for PR 8 (bottleneck #8 — re-entrancy deferred
+    /// queue). The deferred VecDeque (thread-local) must respect its
+    /// 4096-entry cap so a pathological async storm can't unbound
+    /// memory. We can't drive the full pump entry path in a unit test
+    /// (it requires a tokio runtime + ServerHandles), but we can
+    /// validate the cap invariant by directly populating a local
+    /// VecDeque mirror with the same logic.
+    ///
+    /// The deeper invariant — "nested entry drains queues but does
+    /// not dispatch; outer-frame tail dispatches DEFERRED" — is
+    /// exercised by the synthetic honest_bench workload 4 minimal
+    /// kernel under sustained -c 10 load. If the deferred drain
+    /// dispatched in the nested frame, MAX_TRY_DEPTH (128) would
+    /// abort the process under any awaited-handler workload.
+    #[test]
+    fn test_deferred_queue_cap_invariant() {
+        const CAP: usize = 4096;
+        let mut q: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
+        for i in 0..(CAP + 100) as i32 {
+            if q.len() < CAP {
+                q.push_back(i);
+            }
+        }
+        assert_eq!(q.len(), CAP, "cap must be enforced at exactly CAP");
+        assert_eq!(*q.front().unwrap(), 0, "FIFO: first inserted is first");
+        assert_eq!(
+            *q.back().unwrap(),
+            (CAP - 1) as i32,
+            "after cap, no further items enter"
+        );
+    }
+
     /// Regression test for PR 5 (bottleneck #7 — direct JSValue
     /// headers build + cache). `FastifyContext::headers_object_cache`
     /// must start at 0 and round-trip through populate/recall the

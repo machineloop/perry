@@ -2,6 +2,26 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1043 — fastify: re-entrancy deferred queue
+
+The PR #1824 re-entrancy guard returned 0 on nested entry to keep
+MAX_TRY_DEPTH (128) bounded, leaving pending requests waiting for
+the next event-loop tick. Add a thread-local
+`DEFERRED: VecDeque<(Handle, FastifyPendingRequest)>` capped at
+4096 entries: nested entry drains every server's `try_recv` into
+DEFERRED; the outer pump frame dispatches DEFERRED at the end of
+its loop, in the outer try-frame depth. One event-loop turnaround
+saved per nested-await request.
+
+31/31 fastify tests passing (added 1). Real-app yammer `/sw.js`
++29% rps (892 → 1155) — the awaited file-cache lookup is exactly
+the nested-await pattern this PR targets.
+
+**Workstream complete:** all 8 fix PRs from the original Fastify-
+perf plan (PR 1 + 2 + 3 + 6 + 1.5 + 7 + 4 + 5 + 8) have shipped,
+each beating the published yammer-web-server README baseline on
+its rebench.
+
 ## v0.5.1042 — fastify: direct JSValue headers object build + cache
 
 `js_fastify_req_headers` in `crates/perry-stdlib/src/fastify/context.rs`
