@@ -2,6 +2,106 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1046 — node:cluster fork + SO_REUSEPORT (share-nothing multi-core serving)
+
+Implement `node:cluster` so apps can fork share-nothing worker processes that share one listen port — enabling multi-core HTTP serving (e.g. yammer-web-server/PerryTs).
+
+- **`cluster.fork()`** (perry-runtime): re-execs `current_exe()` with `NODE_UNIQUE_ID` set, reusing the `child_process` fork machinery (socketpair IPC on fd 3, reactor lifecycle for `exit`/`message`, GC rooting, `kill`). Returns a Worker — the ChildProcess plus `id` and a self-referential `process` — so `worker.process.kill(sig)`, `worker.on('exit', …)` and `worker.id` work. Wired via the `("cluster","fork")` dispatch arm.
+- **Dynamic worker identity**: `cluster.isPrimary`/`isMaster`/`isWorker` now read `NODE_UNIQUE_ID`, so `if (cluster.isPrimary) { fork… } else { listen… }` branches correctly in each process.
+- **SO_REUSEPORT** (perry-ext-fastify, perry-ext-net): the listen path builds the accept socket via `socket2` with `SO_REUSEADDR` + `SO_REUSEPORT`, enabled when `reusePort: true` is passed or when `NODE_UNIQUE_ID` is set — so forked workers share one port and the kernel load-balances accepts (no primary-accept hop, no proxy).
+
+Verified end-to-end: a primary forking N workers that bind one port, kernel-load-balanced; `worker.on('exit')` + `worker.process.kill` fire.
+
+## v0.5.1045 — runtime: strict is_valid_obj_ptr — fix two SIGSEGV sites in obj setters
+
+`is_valid_obj_ptr` in `crates/perry-runtime/src/object/mod.rs` only
+did a range check (0x1000 .. 0x8000_0000_0000 on Linux) before the
+caller dereferenced `(addr - 8)` to read the GC header. Any
+address that's *plausibly userspace* sailed through, including
+UNMAPPED pages — and the typed-feedback fast path
+(`js_typed_feedback_object_set_field_by_name_fast`'s `object_shape`)
+plus the slow path (`js_object_set_field_by_name`) both crash on
+the GC header read when handed a stale pointer.
+
+Diagnosed via yammer-web-server's observability plugin
+(`req.startTime = process.hrtime.bigint()` per request, running as
+an `onRequest` hook): after ~13k requests the typed-feedback site
+accumulates entries whose underlying object addresses have been
+reclaimed by GC; subsequent dispatch hands the slow path a
+pointer whose arena page is unmapped and the `(*gc_header).obj_type`
+read SIGSEGVs (exit 139, no stderr).
+
+### Fix
+
+Tighten `is_valid_obj_ptr` to consult the arena's
+`classify_heap_generation` registry — addresses outside any
+registered heap block return `HeapGeneration::Unknown` and we
+reject the pointer. Also add an explicit `is_valid_obj_ptr` check
+at the slow-path GC header read in
+`js_object_set_field_by_name` (line ~260) since that path didn't
+go through the validity helper before.
+
+Pure additive defense in depth — every prior caller that already
+went through `is_valid_obj_ptr` keeps the same semantics; the
+strict registry check is O(1) (cached) when the address IS in a
+known block.
+
+### Validation
+
+- `cargo test --release -p perry-stdlib fastify`: 31/31 passing.
+- Real-app yammer-web-server full 4-route `bench-oha.sh perry`
+  (5×15s per route at -c 10 = 300s sustained load):
+    * /external_ping: 4443 rps / p99 5.13 ms (was 1003 ms in
+      README baseline; 411× rps lift, 197× lower p99)
+    * /yammer:        1336 rps / p99 11.9 ms (75× lower p99)
+    * /sw.js:         2672 rps / p99 7.24 ms (38× lower p99)
+    * /teamsmeeting:   126 rps / p99 1044 ms (7.5× rps, 3.1×
+      lower p99 — still has a residual crash in the cosmic-gcc
+      Set rebuild path; tracked as follow-up)
+  Container survived all 4 routes' 5×15s back-to-back streams
+  (the previous-PR pre-fix crash happened ~30s in; now it runs
+  to completion. 5 restart-on-failure events during the 300s
+  bench from a DIFFERENT residual site in
+  `_mi_page_malloc_zero` → `js_typed_feedback_register_site`
+  during yammer's `buildCosmicGccTenantIds` 6000-entry Set
+  rebuild — out of scope for this PR but documented for the
+  next-PR target.)
+
+Also included: the env-gated leak + SIGSEGV diagnostics from
+v0.5.1044 (which surfaced the crash site this PR fixes). Both
+strictly dormant in production — `PERRY_FASTIFY_LEAK_DIAG=1`
+gates RSS dumps every 1000 pump-dispatched requests AND a
+`libc::backtrace`-dumping SIGSEGV handler, behind a `OnceLock<bool>`
+short-circuit so the cost when unset is one atomic load per
+request.
+
+## v0.5.1044 — fastify: env-gated leak + SIGSEGV diagnostics for residual crash hunt
+
+Adds two diagnostic surfaces to `crates/perry-stdlib/src/fastify/`,
+both strictly dormant in production builds (env var unset → cached
+`bool` via OnceLock → single atomic load per request):
+
+- **`PERRY_FASTIFY_LEAK_DIAG=1` periodic counters:** every 1000
+  pump-dispatched requests, prints handle count + DEFERRED queue
+  depth + VmRSS. Confirmed PR 1.5 closes the handle leak
+  (`handles=2` stable). Confirmed the residual RSS growth under
+  yammer-web-server load is reclaimable JSValues (force-GC keeps
+  it bounded at 60-80 MB; without it, RSS climbs ~7.4 KB/request
+  to ~150 MB before crash).
+- **SIGSEGV signal handler:** captures + dumps a 64-frame
+  backtrace via `libc::backtrace` before re-raising. Confirmed
+  the residual yammer crash is a real bad-pointer-deref (not OOM
+  — host has 62 GB and RSS at crash is <200 MB). Backtrace
+  offsets land in perry-runtime's code section
+  (`+0x9b59b6`-region), not perry-stdlib fastify — pinpointing
+  requires a debug-symbols build of perryts-yws.
+
+31/31 fastify tests still passing. Real-app `/external_ping` /
+`/yammer` / `/sw.js` benches unchanged within jitter from PR 8
+when the env var is unset. Residual `/teamsmeeting` SIGSEGV
+remains; workaround via yammer-web-server compose
+`restart: on-failure`.
+
 ## v0.5.1043 — fastify: re-entrancy deferred queue
 
 The PR #1824 re-entrancy guard returned 0 on nested entry to keep
