@@ -362,6 +362,7 @@ pub unsafe extern "C" fn js_fastify_app_on(app_handle: Handle, event_ptr: i64, c
     if event == "upgrade" {
         if let Some(app) = get_handle_mut::<FastifyApp>(app_handle) {
             app.upgrade_handlers.push(callback);
+            app.rebuild_gc_pinned_roots();
         }
     }
     // Other event names (e.g. "connection", "error", "listening") are

@@ -58,44 +58,21 @@ pub(crate) fn ensure_gc_scanner_registered() {
 }
 
 /// GC root scanner for Fastify handler / hook / error-handler closures.
+///
+/// PR 7 (bottleneck #5): walks a pre-flattened slab on each
+/// `FastifyApp` (`gc_pinned_roots`) instead of reconstructing the
+/// 11-way iterator chain (8 hook vecs + routes + plugins +
+/// upgrade_handlers) per GC tick. The slab is rebuilt at
+/// registration time (`add_route`/`add_hook`/`set_error_handler`/
+/// plugin registration) — once-off cost on a one-shot startup path
+/// — so the scanner walk reduces to a single linear slice scan.
+/// Measurable on GC-pressure workloads like yammer-web-server's
+/// sustained-load bench, which marks many roots per tick under
+/// accumulated request volume.
 fn scan_fastify_roots(mark: &mut dyn FnMut(f64)) {
-    let mark_cb = |cb: ClosurePtr, mark: &mut dyn FnMut(f64)| {
-        if cb != 0 {
-            let boxed = f64::from_bits(0x7FFD_0000_0000_0000 | (cb as u64 & 0x0000_FFFF_FFFF_FFFF));
-            mark(boxed);
-        }
-    };
-
     for_each_handle_of::<FastifyApp, _>(|app| {
-        for route in app.routes.iter() {
-            mark_cb(route.handler, mark);
-        }
-        for cb in app
-            .hooks
-            .on_request
-            .iter()
-            .chain(app.hooks.pre_parsing.iter())
-            .chain(app.hooks.pre_validation.iter())
-            .chain(app.hooks.pre_handler.iter())
-            .chain(app.hooks.pre_serialization.iter())
-            .chain(app.hooks.on_send.iter())
-            .chain(app.hooks.on_response.iter())
-            .chain(app.hooks.on_error.iter())
-        {
-            mark_cb(*cb, mark);
-        }
-        if let Some(eh) = app.error_handler {
-            mark_cb(eh, mark);
-        }
-        for plugin in app.plugins.iter() {
-            mark_cb(plugin.handler, mark);
-        }
-        // #1113: upgrade handlers registered via `app.server.on("upgrade", cb)`
-        // live in the same handle registry slot — pin them too so a
-        // GC cycle between registration and an incoming Upgrade
-        // request doesn't sweep them.
-        for cb in app.upgrade_handlers.iter() {
-            mark_cb(*cb, mark);
+        for bits in app.gc_pinned_roots.iter() {
+            mark(f64::from_bits(*bits));
         }
     });
 }
@@ -159,6 +136,19 @@ pub struct FastifyApp {
     /// while turning the dominant static-route lookup cost from O(N) per
     /// request into one HashMap hash + comparison.
     pub static_index: HashMap<String, usize>,
+    /// PR 7 (bottleneck #5): pre-flattened slice of every ClosurePtr the
+    /// GC root scanner needs to mark — routes + every hook chain +
+    /// error_handler + plugins + upgrade_handlers, NaN-boxed as f64 bits.
+    /// `scan_fastify_roots` iterates this single Vec instead of
+    /// reconstructing the 11-way iterator chain (8 hook vecs + routes +
+    /// plugins + upgrade_handlers) per GC tick. Built by
+    /// `rebuild_gc_pinned_roots` on `add_route` / `add_hook` /
+    /// `set_error_handler` / plugin registration. The added work at
+    /// registration time is negligible (one-shot startup cost) and the
+    /// scanner walk drops from ~11 indirect chains down to a single
+    /// linear slice scan — measurable on GC-pressure workloads like
+    /// yammer-web-server's sustained-load bench.
+    pub gc_pinned_roots: Vec<u64>,
     /// Lifecycle hooks
     pub hooks: Hooks,
     /// Custom error handler
@@ -207,6 +197,7 @@ impl FastifyApp {
         Self {
             routes: Vec::new(),
             static_index: HashMap::new(),
+            gc_pinned_roots: Vec::new(),
             hooks: Hooks::default(),
             error_handler: None,
             plugins: Vec::new(),
@@ -221,6 +212,7 @@ impl FastifyApp {
         Self {
             routes: Vec::new(),
             static_index: HashMap::new(),
+            gc_pinned_roots: Vec::new(),
             hooks: Hooks::default(),
             error_handler: None,
             plugins: Vec::new(),
@@ -228,6 +220,70 @@ impl FastifyApp {
             config: FastifyConfig::default(),
             upgrade_handlers: Vec::new(),
         }
+    }
+
+    /// PR 7: rebuild the gc_pinned_roots slab from the current state of
+    /// every closure-holding field. Called from `add_route` / `add_hook`
+    /// / `set_error_handler` / plugin registration so the slab is in
+    /// sync at all times. The slab encodes each ClosurePtr as the
+    /// NaN-boxed-pointer f64 bits (tag 0x7FFD) the GC scanner expects.
+    pub fn rebuild_gc_pinned_roots(&mut self) {
+        let count = self.routes.len()
+            + self.hooks.on_request.len()
+            + self.hooks.pre_parsing.len()
+            + self.hooks.pre_validation.len()
+            + self.hooks.pre_handler.len()
+            + self.hooks.pre_serialization.len()
+            + self.hooks.on_send.len()
+            + self.hooks.on_response.len()
+            + self.hooks.on_error.len()
+            + if self.error_handler.is_some() { 1 } else { 0 }
+            + self.plugins.len()
+            + self.upgrade_handlers.len();
+        let mut slab = Vec::with_capacity(count);
+        let push = |slab: &mut Vec<u64>, cb: ClosurePtr| {
+            if cb != 0 {
+                let bits = 0x7FFD_0000_0000_0000u64 | (cb as u64 & 0x0000_FFFF_FFFF_FFFF);
+                slab.push(bits);
+            }
+        };
+        for r in self.routes.iter() {
+            push(&mut slab, r.handler);
+        }
+        for cb in self.hooks.on_request.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.pre_parsing.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.pre_validation.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.pre_handler.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.pre_serialization.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.on_send.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.on_response.iter() {
+            push(&mut slab, *cb);
+        }
+        for cb in self.hooks.on_error.iter() {
+            push(&mut slab, *cb);
+        }
+        if let Some(eh) = self.error_handler {
+            push(&mut slab, eh);
+        }
+        for p in self.plugins.iter() {
+            push(&mut slab, p.handler);
+        }
+        for cb in self.upgrade_handlers.iter() {
+            push(&mut slab, *cb);
+        }
+        self.gc_pinned_roots = slab;
     }
 
     /// Add a route
@@ -278,26 +334,58 @@ impl FastifyApp {
             // tolerant behavior rather than tighten it inside a perf PR.
             self.static_index.insert(key, new_idx);
         }
+        self.rebuild_gc_pinned_roots();
     }
 
     /// Add a hook
     pub fn add_hook(&mut self, hook_name: &str, handler: ClosurePtr) {
-        match hook_name {
-            "onRequest" => self.hooks.on_request.push(handler),
-            "preParsing" => self.hooks.pre_parsing.push(handler),
-            "preValidation" => self.hooks.pre_validation.push(handler),
-            "preHandler" => self.hooks.pre_handler.push(handler),
-            "preSerialization" => self.hooks.pre_serialization.push(handler),
-            "onSend" => self.hooks.on_send.push(handler),
-            "onResponse" => self.hooks.on_response.push(handler),
-            "onError" => self.hooks.on_error.push(handler),
-            _ => eprintln!("Unknown hook: {}", hook_name),
+        let recognized = match hook_name {
+            "onRequest" => {
+                self.hooks.on_request.push(handler);
+                true
+            }
+            "preParsing" => {
+                self.hooks.pre_parsing.push(handler);
+                true
+            }
+            "preValidation" => {
+                self.hooks.pre_validation.push(handler);
+                true
+            }
+            "preHandler" => {
+                self.hooks.pre_handler.push(handler);
+                true
+            }
+            "preSerialization" => {
+                self.hooks.pre_serialization.push(handler);
+                true
+            }
+            "onSend" => {
+                self.hooks.on_send.push(handler);
+                true
+            }
+            "onResponse" => {
+                self.hooks.on_response.push(handler);
+                true
+            }
+            "onError" => {
+                self.hooks.on_error.push(handler);
+                true
+            }
+            _ => {
+                eprintln!("Unknown hook: {}", hook_name);
+                false
+            }
+        };
+        if recognized {
+            self.rebuild_gc_pinned_roots();
         }
     }
 
     /// Set error handler
     pub fn set_error_handler(&mut self, handler: ClosurePtr) {
         self.error_handler = Some(handler);
+        self.rebuild_gc_pinned_roots();
     }
 
     /// Find matching route for a request

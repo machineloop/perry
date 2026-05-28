@@ -357,6 +357,82 @@ mod app_tests {
     /// suffix. Otherwise routes registered via `app.add_route("GET",
     /// "/users", ...)` on a `with_prefix("/api")` app would miss the
     /// index lookup for the actual request URL `/api/users`.
+    /// Regression test for PR 7 (bottleneck #5 — single-slab GC root).
+    /// The GC root scanner used to reconstruct an 11-way iterator
+    /// chain (routes + 8 hook vecs + plugins + upgrade_handlers) per
+    /// scan tick. PR 7 precomputes a `gc_pinned_roots: Vec<u64>` slab
+    /// on `FastifyApp` that the scanner walks as one linear slice —
+    /// rebuilt by `add_route`/`add_hook`/`set_error_handler` at
+    /// registration time. The invariant this test guards:
+    ///   * the slab contains exactly one NaN-boxed-pointer entry per
+    ///     non-zero ClosurePtr across routes/hooks/error_handler/
+    ///     plugins/upgrade_handlers
+    ///   * every entry has the 0x7FFD POINTER_TAG nibble that
+    ///     scan_fastify_roots passes to `mark()`
+    /// A regression that forgets to rebuild the slab after a
+    /// registration (or that mismatches the tag) would let GC sweep
+    /// handlers between registration and dispatch — the same root
+    /// cause issue #35 fixed at the iter-chain level.
+    #[test]
+    fn test_gc_pinned_roots_slab_population() {
+        use crate::fastify::FastifyApp;
+
+        let mut app = FastifyApp::new();
+        assert!(app.gc_pinned_roots.is_empty(), "fresh app has empty slab");
+
+        app.add_route("GET", "/a", 0x111);
+        app.add_route("POST", "/b", 0x222);
+        app.add_hook("onRequest", 0x333);
+        app.add_hook("preHandler", 0x444);
+        app.set_error_handler(0x555);
+
+        // 2 routes + 2 hooks + 1 error_handler = 5 entries.
+        assert_eq!(
+            app.gc_pinned_roots.len(),
+            5,
+            "slab should have one entry per non-zero ClosurePtr"
+        );
+
+        // Each entry must carry the POINTER_TAG nibble in the top 16
+        // bits so scan_fastify_roots' `mark(f64::from_bits(...))`
+        // dispatches the right scanner code path.
+        for &bits in &app.gc_pinned_roots {
+            assert_eq!(
+                bits & 0xFFFF_0000_0000_0000,
+                0x7FFD_0000_0000_0000,
+                "every slab entry must have NaN-boxed POINTER_TAG; got {:016x}",
+                bits
+            );
+        }
+
+        // The original ClosurePtrs round-trip through the encoding.
+        let extracted: std::collections::HashSet<i64> = app
+            .gc_pinned_roots
+            .iter()
+            .map(|b| (b & 0x0000_FFFF_FFFF_FFFF) as i64)
+            .collect();
+        for ptr in [0x111, 0x222, 0x333, 0x444, 0x555] {
+            assert!(
+                extracted.contains(&ptr),
+                "expected ClosurePtr {:#x} in slab",
+                ptr
+            );
+        }
+
+        // Adding another route incrementally rebuilds the slab.
+        app.add_route("DELETE", "/c", 0x666);
+        assert_eq!(app.gc_pinned_roots.len(), 6);
+
+        // Zero ClosurePtrs are filtered (avoids marking a bogus
+        // 0x7FFD_0000_0000_0000 root).
+        let mut zero_app = FastifyApp::new();
+        zero_app.add_route("GET", "/", 0);
+        assert!(
+            zero_app.gc_pinned_roots.is_empty(),
+            "zero ClosurePtr must not enter the slab"
+        );
+    }
+
     #[test]
     fn test_static_index_respects_prefix() {
         use crate::fastify::FastifyApp;

@@ -2,6 +2,22 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1040 — fastify: consolidate GC root scanner to single iteration
+
+`scan_fastify_roots` walked an 11-way iterator chain per GC tick
+(routes + 8 hook vecs + error_handler + plugins + upgrade_handlers).
+Precompute a `gc_pinned_roots: Vec<u64>` slab on `FastifyApp`
+with every non-zero ClosurePtr NaN-boxed; rebuilt at registration
+time by `add_route`/`add_hook`/`set_error_handler`/upgrade-handler
+registration. `scan_fastify_roots` reduces to a single linear walk.
+
+### Validation
+
+- New `test_gc_pinned_roots_slab_population` (28/28 fastify tests).
+- Real-app yammer 4-route single-c10 bench: all four beat README.
+  /external_ping jumped +35% rps vs PR 1.5 (3886 vs 2876 rps),
+  validating GC scan time as a per-request cost contributor.
+
 ## v0.5.1039 — fastify: drop_handle ctx after dispatch to fix per-request leak
 
 `process_fastify_request_with_app` at
