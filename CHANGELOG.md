@@ -2,6 +2,63 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1034 — benchmarks: add honest_bench workload 4 — Fastify HTTP throughput
+
+New long-running HTTP server workload in `benchmarks/honest_bench/`
+backing the Fastify perf workstream tracked in
+`.claude/plans/look-at-the-benchmarks-jazzy-llama.md`. Default sweep
+is unchanged (`HONEST_BENCH_ONLY="1,3"`); workload 4 is opt-in via
+`HONEST_BENCH_ONLY=4` so existing CI is untouched.
+
+### What's new
+
+- `benchmarks/honest_bench/workloads/4_http_fastify/` — three kernel
+  pairs (`perry/` + `node/`) exercising different code paths:
+  - `minimal.ts` — `GET /` returning `{ok: true}` JSON. Isolates
+    framework overhead + JSON.stringify of a one-field object.
+  - `text.ts` — `GET /` returning `'pong'` text/plain. Isolates the
+    primitive response fast path (targets fix #1 in the workstream).
+  - `parametric.ts` — `GET /users/:id` returning `{id: req.params.id}`.
+    Exercises router pattern matching (fix #3) + per-request params
+    object allocation (fix #4) + Arc-shared request fields (fix #2).
+- `benchmarks/honest_bench/harness/run_http_bench.sh` — sibling of
+  `run_bench.sh` for long-running servers: spawns the binary, polls
+  TCP listen, drives `oha -c 10 -z 15s --output-format json` for each
+  measured run, scrapes peak RSS from `/proc/<pid>/status`, kills with
+  SIGTERM. Emits one row per measured run in the same JSON shape as
+  `run_bench.sh` (with `wall_ms = 1_000_000 / rps` encoded so
+  `scripts/summary.py`'s "lower is better" sort still ranks correctly)
+  plus four HTTP-specific keys: `rps`, `p50_ms`, `p95_ms`, `p99_ms`,
+  `success_rate`, `status_codes`.
+- `benchmarks/honest_bench/run.sh` wires workload 4 into the build
+  step (compiles Perry kernels, `npm install`s the node side once on
+  first run) and the run step (invokes `run_http_bench.sh` for each
+  kernel × language pair). Node kernel invocations wrap in
+  `bash -c "cd ... && exec node --import tsx ..."` so `tsx` resolves
+  from the kernel's local `node_modules`.
+
+### Verification
+
+End-to-end smoke pass: built `minimal.ts` via
+`target/release/perry workloads/4_http_fastify/perry/minimal.ts -o ...`,
+ran `harness/run_http_bench.sh` for 1 warmup + 1 measured at
+HONEST_BENCH_HTTP_DURATION=3s. Perry minimal: 13.3 rps / p99
+1000.7 ms — reproduces the ~1-second-per-request floor reported in
+yammer-web-server/benchmarks/README.md (10.7 rps / p99 1004 ms)
+without needing the full yammer-web-server container. Node minimal:
+14,707 rps / p99 1.998 ms — ~1100× faster than Perry today, which is
+the gap the upcoming PR 1–8 fixes will close.
+
+### Out of scope
+
+- `benchmarks/baseline.json` is NOT touched in this PR; the
+  http_fastify rows will be added by PR 1 once the event-loop wakeup
+  floor is fixed and the numbers settle.
+- No correctness gate (`check_output.py`) entries are added; HTTP
+  throughput has no canonical response payload to sha256 (every
+  request returns `200 OK` with a tiny known body, and the metric of
+  interest is rate, not content). `output_match` is reported as `null`.
+
 ## v0.5.1033 — allowlist class_registry.rs for the file-size lint gate
 
 `crates/perry-runtime/src/object/class_registry.rs` crossed the 2000-line

@@ -123,6 +123,11 @@ issue42_noalloc
 enum_repro
 no_pragma_test
 
+# Compiled honest_bench workload 4 binaries (next to their .ts sources)
+benchmarks/honest_bench/workloads/4_http_fastify/perry/minimal
+benchmarks/honest_bench/workloads/4_http_fastify/perry/parametric
+benchmarks/honest_bench/workloads/4_http_fastify/perry/text
+
 # Test output
 test-parity/output/
 test-parity/reports/
