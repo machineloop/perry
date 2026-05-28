@@ -2,6 +2,54 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1035 — fastify: wake event-loop pump after enqueuing pending request
+
+Single-line fix in `crates/perry-stdlib/src/fastify/server.rs` that
+calls `perry_runtime::event_pump::js_notify_main_thread()` immediately
+after `request_tx.send(pending).await` succeeds in the hyper service
+fn (around the existing line 400 `is_err` guard). Without this, the
+main-thread dispatcher's `js_wait_for_event` condvar slept to its
+1-second idle cap before draining the queue, capping throughput at
+~10 req/s/connection regardless of handler cost — observable as
+`/external_ping` at 10.7 rps / p99 1004 ms on the
+yammer-web-server bench (`benchmarks/results/perry-pre-optimization/`)
+with the container at 0.13% CPU, pure wait, not work. The pump's
+doc comment around line 938–983 already states the contract:
+"the dispatcher wakes the moment any stdlib worker calls
+js_notify_main_thread" — the tokio service path was just never
+updated to call it.
+
+### Validation
+
+- New regression test in `crates/perry-stdlib/src/fastify/server.rs`:
+  `test_notify_main_thread_wakes_pump_before_idle_cap` — spins a
+  background thread blocked in `js_wait_for_event`, fires a notify
+  from another thread, asserts wake round-trip <250 ms (the 1 s cap
+  is the ceiling we're proving we stay under). Together with the 22
+  pre-existing fastify tests: `cargo test --release -p perry-stdlib
+  fastify` reports 23/23 passing.
+- Synthetic honest_bench workload 4 (`http_fastify_minimal`):
+  before PR 1 = 13.3 rps / p99 1000.7 ms; after = **7219 rps /
+  p99 2.23 ms** — a 540× lift, putting Perry within 2× of Node
+  (14,707 rps / p99 1.99 ms).
+- Real-app yammer-web-server `/external_ping` bench (5×15s at -c 10
+  via `benchmarks/methodology/bench-oha.sh perry` against the
+  `perryts-yws:local` image built with this Perry):
+  **2791.5 rps / p99 7.28 ms — a 258× rps lift and 138× lower p99
+  vs the published README baseline of 10.8 rps / p99 1003 ms.**
+
+### Known follow-up
+
+The yammer-web-server `/yammer`, `/sw.js`, and `/teamsmeeting`
+routes cannot be measured against the README baseline in this PR
+because of a pre-existing SIGSEGV (exit 139, no stderr) under
+sustained `-c 10` concurrent load that PR 0a's bench already
+flagged on the apt-pinned 0.5.1022 build. The crash is not
+introduced by PR 1; it surfaces sooner because throughput is no
+longer bottlenecked at 10 rps. An unscheduled hotfix ahead of PR 2
+in the workstream should isolate and fix it. See
+`yammer-web-server/benchmarks/results/perry-pr1/FINDINGS.md`.
+
 ## v0.5.1034 — benchmarks: add honest_bench workload 4 — Fastify HTTP throughput
 
 New long-running HTTP server workload in `benchmarks/honest_bench/`

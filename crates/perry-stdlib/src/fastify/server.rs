@@ -403,6 +403,17 @@ async fn handle_request(
             .body(Full::new(Bytes::from("Server unavailable")))
             .unwrap());
     }
+    // Wake the main-thread pump immediately. Without this, the dispatcher's
+    // `js_wait_for_event` condvar sleeps to its 1 s idle cap before draining
+    // the queue, capping throughput at ~1 req/s/connection regardless of
+    // handler cost. The pump's doc comment (see process_fastify_request*
+    // below) already states the contract: "the dispatcher wakes the moment
+    // any stdlib worker calls js_notify_main_thread" — but the tokio service
+    // path was never updated to call it. Diagnosed via yammer-web-server's
+    // 4-way bench: /external_ping at 10.7 rps / p99 1004 ms, container at
+    // 0.13% CPU — pure wait, not work. Cited in
+    // .claude/plans/look-at-the-benchmarks-jazzy-llama.md (PR 1).
+    perry_runtime::event_pump::js_notify_main_thread();
 
     // Wait for response
     match response_rx.await {
@@ -1401,6 +1412,82 @@ mod tests {
         assert_eq!(
             app.match_route("OPTIONS", "/resource").unwrap().0.handler,
             7
+        );
+    }
+
+    /// Regression test for the ~1 s/req wakeup floor (yammer-web-server
+    /// PR 0a finding, PR 1 fix). The fastify hyper service fn must call
+    /// `perry_runtime::event_pump::js_notify_main_thread()` immediately
+    /// after enqueuing a pending request, so the main-thread pump's
+    /// `js_wait_for_event` condvar returns within microseconds instead
+    /// of waiting for its 1 s idle cap. Without the notify, the same
+    /// flow takes 1 000 ms per request — observable as `/external_ping`
+    /// at 10.7 rps / p99 1004 ms in benchmarks/results/perry/.
+    ///
+    /// This test exercises the wake primitive in isolation: spin a
+    /// background thread that blocks in `js_wait_for_event`, fire a
+    /// notify from another thread (simulating the tokio service task),
+    /// and assert the waiter returns well under the 1 s idle cap.
+    ///
+    /// NOTE: this test does NOT assert that handle_request itself calls
+    /// the notify — that would require a full tokio + hyper integration
+    /// harness. The integration-level proof lives in the workload 4
+    /// synthetic bench (`benchmarks/honest_bench/workloads/4_http_fastify/`)
+    /// and the yammer-web-server real-app rebench: PR 1 must push
+    /// /external_ping p99 from ~1004 ms to single-digit ms. This unit
+    /// test is the canary: if the wake primitive itself ever regresses,
+    /// no amount of `js_notify_main_thread` calls from the fastify path
+    /// will help.
+    #[test]
+    fn test_notify_main_thread_wakes_pump_before_idle_cap() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Instant;
+
+        // Burn any stale notify left by earlier tests in the same
+        // binary: js_wait_for_event with NOTIFIED=true returns
+        // immediately on the fast path and clears the flag, so a
+        // single call before the timed region drains the queue.
+        // On a fresh binary this is a no-op (NOTIFIED starts false
+        // and the function still returns fast — see #1114 spin
+        // accounting). Either way we then know the next waiter is
+        // entering a real wait, not the fast path.
+        perry_runtime::event_pump::js_notify_main_thread();
+        perry_runtime::event_pump::js_wait_for_event();
+
+        let woken = Arc::new(AtomicBool::new(false));
+        let woken_in_thread = Arc::clone(&woken);
+        let start = Instant::now();
+
+        let waiter = thread::spawn(move || {
+            perry_runtime::event_pump::js_wait_for_event();
+            woken_in_thread.store(true, Ordering::Release);
+        });
+
+        // Yield long enough for the waiter to enter the cvar.wait_timeout
+        // codepath (not the NOTIFIED fast-path return). 25 ms is overkill
+        // on real hardware but keeps the test deterministic in CI.
+        thread::sleep(Duration::from_millis(25));
+        perry_runtime::event_pump::js_notify_main_thread();
+
+        waiter.join().expect("waiter thread panicked");
+        let elapsed = start.elapsed();
+
+        assert!(
+            woken.load(Ordering::Acquire),
+            "waiter did not observe the notify before joining"
+        );
+        // The 1 s idle cap is the ceiling we're proving we stay well
+        // under. A passing wake path returns in single-digit ms;
+        // 250 ms headroom is for slow CI runners. A failure means
+        // either (a) the notify primitive regressed in perry_runtime,
+        // or (b) the condvar is being signalled but not observed —
+        // both re-introduce the yammer-web-server wakeup floor.
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "notify→wake round-trip took {elapsed:?}, expected <250 ms \
+             (1 s idle cap means the wake path is broken)"
         );
     }
 }
