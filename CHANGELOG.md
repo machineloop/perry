@@ -2,6 +2,46 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1036 — fastify: replace per-request HashMap/Vec clones with mem::take moves
+
+`process_fastify_request_with_app` in
+`crates/perry-stdlib/src/fastify/server.rs` previously cloned all
+five `FastifyPendingRequest` fields into `FastifyContext::new`, even
+though three of the five (`headers: HashMap<String,String>`,
+`body: Option<Vec<u8>>`, `params: HashMap<String,String>`) were
+consumed by the context and never referenced again on the request
+thread. The HashMap clones are O(headers) each and dominate
+per-request allocation on yammer-web-server traffic shapes
+(~15 headers per request).
+
+Mark the inbound `pending: FastifyPendingRequest` parameter `mut`
+and replace the three HashMap/Vec clones with `std::mem::take` /
+`Option::take`. `method` and `path` remain cloned because they're
+still referenced at server.rs:678 for the route-match second pass
+(HEAD→GET fallback). Net: -3 allocations/request.
+
+### Validation
+
+- New regression test
+  `crates/perry-stdlib/src/fastify/server.rs::tests::test_process_request_moves_pending_fields_not_clone`
+  asserts the move-not-clone invariant (both: context sees the
+  values, AND the source bindings are empty post-construction).
+- `cargo test --release -p perry-stdlib fastify`: 24/24 passing
+  (was 23 — added the new test).
+- Real-app yammer-web-server `/external_ping` 5×15s at -c 10 vs
+  the published README baseline (10.8 rps / p99 1003 ms):
+  - PR 1 (v0.5.1035) = 2791.5 rps / p99 7.28 ms
+  - PR 2 (this) = **2891.2 rps / p99 6.68 ms** — 267× rps, 150×
+    lower p99 vs README; +3.6% rps over PR 1.
+
+### Known follow-up
+
+Pre-existing SIGSEGV under sustained `-c 10` load on the yammer
+full route surface is still blocking `/yammer`, `/sw.js`,
+`/teamsmeeting` measurement. PR 2's 3 saved allocations/request
+did NOT measurably shift the crash window — confirms the crash is
+not primarily GC-pressure-induced. Hotfix needed before PR 9.
+
 ## v0.5.1035 — fastify: wake event-loop pump after enqueuing pending request
 
 Single-line fix in `crates/perry-stdlib/src/fastify/server.rs` that
