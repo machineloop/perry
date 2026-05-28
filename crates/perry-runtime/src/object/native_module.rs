@@ -1752,12 +1752,22 @@ pub(crate) unsafe fn get_native_module_constant(
         // `setupMaster` / `Worker` callables are produced separately by
         // `is_native_module_callable_export` (bound-method closure path).
         "cluster" => match property {
-            // Identity flags: we always identify as the primary
-            // process. A future `cluster.fork` impl would need to flip
-            // these in the spawned child.
-            "isPrimary" | "isMaster" => Some(f64::from_bits(JSValue::bool(true).bits())),
-            "isWorker" => Some(f64::from_bits(JSValue::bool(false).bits())),
-            // No active worker on the primary side.
+            // Identity flags are dynamic (#cluster): a forked worker carries
+            // NODE_UNIQUE_ID in its env (set by `cluster.fork`). Var unset →
+            // primary (isPrimary/isMaster true, isWorker false); var set →
+            // worker (the inverse). This is what lets the canonical
+            // `if (cluster.isPrimary) { fork… } else { listen… }` wrapper
+            // branch correctly in each process.
+            "isPrimary" | "isMaster" => {
+                let is_worker = std::env::var("NODE_UNIQUE_ID").is_ok();
+                Some(f64::from_bits(JSValue::bool(!is_worker).bits()))
+            }
+            "isWorker" => {
+                let is_worker = std::env::var("NODE_UNIQUE_ID").is_ok();
+                Some(f64::from_bits(JSValue::bool(is_worker).bits()))
+            }
+            // `cluster.worker` is populated on the worker side in Part B;
+            // undefined on the primary.
             "worker" => Some(f64::from_bits(JSValue::undefined().bits())),
             // Empty registries — each read allocates a fresh empty
             // object (the test only reads them once, so the allocation

@@ -411,6 +411,14 @@ pub(super) extern "C" fn cp_emit_spawn_error(closure: *const ClosureHeader) -> f
     cp_undefined()
 }
 
+/// #cluster — hook invoked by `cluster.fork` after a worker spawns. The worker
+/// ChildProcess is already GC-rooted + lifecycle-managed by
+/// `cp_register_live_child` (so fork+serve works today). Recording workers for
+/// `cluster.workers` and re-emitting cluster-level `exit`/`online` events is
+/// layered on next, from the reactor's existing exit path where the live `cp`
+/// is in hand and GC-valid.
+pub(super) fn cluster_register_worker(_worker_id: u64, _worker: f64) {}
+
 pub(super) fn cp_register_reactor_arities() {
     crate::closure::js_register_closure_arity(cp_emit_spawn_error as *const u8, 0);
 }

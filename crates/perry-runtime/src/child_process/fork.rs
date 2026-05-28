@@ -19,6 +19,9 @@
 use super::*;
 use std::process::{Command, Stdio};
 
+/// Monotonic worker id for `cluster.fork()` (Node assigns 1,2,3,…).
+static CLUSTER_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// `child_process.fork(modulePath[, args][, options])`. `module_ptr`/`args_ptr`
 /// are raw (unboxed) `StringHeader` / `ArrayHeader` pointers; `opts_ptr` is a
 /// raw heap pointer (or 0). Returns a NaN-boxed ChildProcess.
@@ -129,6 +132,115 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
             b"__cpError",
             crate::value::js_nanbox_pointer(err as i64),
         );
+        let emit_closure =
+            crate::closure::js_closure_alloc(reactor::cp_emit_spawn_error as *const u8, 1);
+        crate::closure::js_closure_set_capture_ptr(emit_closure, 0, cp.to_bits() as i64);
+        crate::timer::js_set_immediate_callback(emit_closure as i64);
+    }
+    cp
+}
+
+/// `cluster.fork([env])` — spawn a worker that re-execs THIS binary.
+///
+/// Perry is AOT, so unlike `child_process.fork` (which launches an interpreter
+/// on a module) a cluster worker simply re-runs the same program: the child
+/// gets `NODE_UNIQUE_ID` in its env, which flips `cluster.isPrimary`/`isWorker`
+/// (see native_module.rs), so the canonical
+/// `if (cluster.isPrimary) { fork… } else { listen… }` wrapper takes the worker
+/// branch. Port sharing across workers is handled in the listen path: the
+/// fastify/net binders enable SO_REUSEPORT when `NODE_UNIQUE_ID` is set, so the
+/// kernel load-balances accepts across workers (no primary-accept hop).
+///
+/// We reuse the `fork()` machinery wholesale — the IPC socketpair (fd 3 /
+/// `NODE_CHANNEL_FD`), the reactor lifecycle (`exit`/`message`/`disconnect`,
+/// live `kill`), and GC rooting. The returned Worker is the ChildProcess plus
+/// an `id` and a self-referential `process`, which satisfies the common
+/// `worker.process.kill(sig)` / `worker.id` / `worker.on('exit', …)` usage.
+#[no_mangle]
+pub extern "C" fn js_cluster_fork(env_ptr: i64) -> f64 {
+    cp_register_arities();
+    reactor::cp_register_reactor_arities();
+
+    let worker_id = CLUSTER_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    // Re-exec the running binary (Perry AOT: the "program" is current_exe()).
+    let exec_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .or_else(|| std::env::args().next())
+        .unwrap_or_default();
+
+    let env_val = if env_ptr > 0x10000 {
+        cp_box_ptr(env_ptr as *const u8)
+    } else {
+        cp_undefined()
+    };
+
+    let stdout_obj = cp_build_readable();
+    let stderr_obj = cp_build_readable();
+    let stdin_obj = cp_build_writable();
+
+    // Same EventEmitter + send/disconnect surface as fork()'s ChildProcess.
+    let cp_methods: [(&str, CpFn); 12] = [
+        ("on", cp_cast2(cp_method_on)),
+        ("once", cp_cast2(cp_method_on)),
+        ("addListener", cp_cast2(cp_method_on)),
+        ("prependListener", cp_cast2(cp_method_on)),
+        ("removeListener", cp_cast2(cp_method_remove_listener)),
+        ("off", cp_cast2(cp_method_remove_listener)),
+        ("removeAllListeners", cp_cast1(cp_method_remove_all_listeners)),
+        ("emit", cp_cast2(cp_method_emit)),
+        ("kill", cp_cast1(cp_method_kill)),
+        ("destroy", cp_cast1(cp_method_kill)),
+        ("send", cp_cast2(cp_method_send)),
+        ("disconnect", cp_cast0(cp_method_disconnect)),
+    ];
+    let cp_obj = cp_build_object(&cp_methods, CP_SHAPE_ID + 0x40 + cp_methods.len() as u32);
+    let cp = cp_box_ptr(cp_obj as *const u8);
+
+    cp_set_field(cp, b"stdout", stdout_obj);
+    cp_set_field(cp, b"stderr", stderr_obj);
+    cp_set_field(cp, b"stdin", stdin_obj);
+    cp_set_field(cp, b"exitCode", TAG_NULL_F64);
+    cp_set_field(cp, b"signalCode", TAG_NULL_F64);
+    cp_set_field(cp, b"killed", TAG_FALSE_F64);
+    cp_set_field(cp, b"connected", TAG_FALSE_F64);
+    cp_set_field(cp, b"channel", TAG_NULL_F64);
+    // Worker surface: `id`, self-referential `process`, `exitedAfterDisconnect`.
+    cp_set_field(cp, b"id", worker_id as f64);
+    cp_set_field(cp, b"process", cp);
+    cp_set_field(cp, b"exitedAfterDisconnect", TAG_FALSE_F64);
+
+    let mut command = Command::new(&exec_path);
+    // Inherit the parent env (config paths, etc.); MERGE any cluster.fork(env)
+    // keys WITHOUT clearing (Node merges), then stamp NODE_UNIQUE_ID.
+    if let Some(env_obj) = cp_object_ptr(env_val) {
+        let keys = crate::object::js_object_keys(env_obj);
+        if !keys.is_null() {
+            let n = crate::array::js_array_length(keys);
+            for i in 0..n {
+                if let Some(key) = cp_value_to_string(crate::array::js_array_get_f64(keys, i)) {
+                    let v = cp_get_field(env_val, key.as_bytes());
+                    if !JSValue::from_bits(v.to_bits()).is_undefined() {
+                        command.env(&key, cp_coerce_string(v));
+                    }
+                }
+            }
+        }
+    }
+    command.env("NODE_UNIQUE_ID", worker_id.to_string());
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let launched = fork_launch(cp, stdout_obj, stderr_obj, stdin_obj, command);
+    if launched {
+        reactor::cluster_register_worker(worker_id, cp);
+    } else {
+        let msg = format!("cluster.fork failed: {exec_path}");
+        let mp = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
+        let err = crate::error::js_error_new_with_message(mp);
+        cp_set_field(cp, b"__cpError", crate::value::js_nanbox_pointer(err as i64));
         let emit_closure =
             crate::closure::js_closure_alloc(reactor::cp_emit_spawn_error as *const u8, 1);
         crate::closure::js_closure_set_capture_ptr(emit_closure, 0, cp.to_bits() as i64);
