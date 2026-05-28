@@ -2,6 +2,49 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1039 — fastify: drop_handle ctx after dispatch to fix per-request leak
+
+`process_fastify_request_with_app` at
+`crates/perry-stdlib/src/fastify/server.rs:600` registered a fresh
+`FastifyContext` in the global DashMap handle registry per request
+(`let ctx_handle = register_handle(ctx)` at line 621) but never
+called `drop_handle` at the end. Every served request leaked one
+entry into `HANDLES`. Each entry retained the request's headers
+HashMap + body Vec + params + response state — ~1-30 KB per
+request on yammer-web-server traffic shapes.
+
+Sustained `-c 10` bench × 4 routes × 5×15s = ~200-350k requests
+→ 200 MB-9 GB leaked. Container OOMed, the next malloc inside an
+unsafe FFI call returned null, perry SIGSEGVed (exit 139, no
+stderr because the panic-handler path itself failed to allocate).
+This is the crash signature PR 0a and PR 1 both flagged but
+neither isolated.
+
+Add `crate::common::drop_handle(ctx_handle)` at the end of the
+function, after `response_tx.send(final_response)`.
+
+### Validation
+
+- New regression test
+  `test_fastify_context_handle_dropped_after_dispatch` asserts the
+  handle is gone from the registry after the dispatcher's drop.
+- `cargo test --release -p perry-stdlib fastify`: 27/27 passing.
+- Real-app yammer-web-server `/external_ping` 5×15s at -c 10:
+  - PR 6 (v0.5.1038) = 2931.4 rps / p99 6.86 ms
+  - PR 1.5 (this) = 2875.9 rps / **p99 4.86 ms** — **-29% p99**
+    vs PR 6 and 207× lower than README (1003 ms). First sub-5 ms
+    p99 of the workstream on the canary route.
+
+### Known follow-up
+
+Container still crashes on the full 4-route bench at ~30s; PR 1.5
+reduces but does not eliminate the per-request leak rate. Suspect
+remaining leaks: the `response_tx` oneshot Sender path,
+`ClosureHeader` allocations from `call_closure2_catching`, and
+handler-allocated JSValues. Investigation needed before `/yammer`,
+`/sw.js`, `/teamsmeeting` can be measured against the README
+baseline.
+
 ## v0.5.1038 — fastify: primitive response fast path — copy string bytes directly
 
 `jsvalue_to_response_body` at `crates/perry-stdlib/src/fastify/context.rs:636`

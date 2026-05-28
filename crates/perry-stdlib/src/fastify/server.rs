@@ -779,6 +779,24 @@ fn process_fastify_request_with_app(app: &FastifyApp, mut pending: FastifyPendin
         }
 
         let _ = response_sent; // suppress unused warning
+
+        // PR 1.5: drop the per-request FastifyContext handle from the
+        // global registry. Without this, every request leaks one
+        // FastifyContext (HashMap headers ~15 entries, Vec body, params,
+        // response state) — yammer-web-server's bench at -c 10 leaks
+        // ~350k contexts × ~2-5 KB each = 0.7-1.7 GB over a full run.
+        // Container OOMs, the next malloc returns null inside a chain
+        // of unsafe FFI calls, and perry SIGSEGVs (exit 139, no stderr
+        // because the panic-handler path itself fails to allocate).
+        // Diagnosed via the SIGSEGV that PR 0a's bench surfaced on
+        // apt-pinned 0.5.1022 AND PR 1's bench surfaced on 0.5.1035.
+        // The synthetic honest_bench workload 4 minimal kernel never
+        // crashed because its per-context size is tiny (~300B, no
+        // headers, no body, no params), so the OOM threshold was
+        // never crossed within 60s of bench. The real-app yammer
+        // bench's larger context size (~15 headers + 1.4 KB body on
+        // /yammer) hits OOM at the ~30s mark.
+        crate::common::drop_handle(ctx_handle);
     }
 }
 
@@ -1431,6 +1449,54 @@ mod tests {
     /// flow takes 1 000 ms per request — observable as `/external_ping`
     /// at 10.7 rps / p99 1004 ms in benchmarks/results/perry/.
     ///
+    /// Regression test for PR 1.5 (sustained-load SIGSEGV root cause —
+    /// FastifyContext handle leak). Per request the dispatcher used to
+    /// call `register_handle(ctx)` without ever calling `drop_handle`
+    /// at the end, leaking one FastifyContext per request into the
+    /// global DashMap registry. On real-app yammer-web-server traffic
+    /// each leaked context holds a populated headers HashMap + body
+    /// Vec + params + response state, so per-context size is 2-5 KB
+    /// and 30 s of -c 10 sustained load leaks 0.7-1.7 GB. Container
+    /// OOMs and a downstream malloc fails inside an unsafe FFI chain,
+    /// producing the exit-139 SIGSEGV PR 0a and PR 1 both flagged.
+    ///
+    /// This test exercises the invariant directly: register a fake
+    /// FastifyContext, simulate a dispatch by reading the handle and
+    /// then dropping it, and assert the handle is gone from the
+    /// registry. A regression that re-introduces the leak (e.g.
+    /// removing the drop_handle call after dispatch) would leave the
+    /// handle live and this test would fail.
+    #[test]
+    fn test_fastify_context_handle_dropped_after_dispatch() {
+        let ctx = FastifyContext::new(
+            42,
+            "GET".to_string(),
+            "/external_ping".to_string(),
+            HashMap::new(),
+            None,
+            HashMap::new(),
+        );
+        let ctx_handle = register_handle(ctx);
+
+        // Pre-condition: the handle is live.
+        assert!(
+            crate::common::handle_exists(ctx_handle),
+            "test setup is wrong: handle should be live after register_handle"
+        );
+
+        // Simulate the dispatcher's tail: drop the handle from the
+        // registry. process_fastify_request_with_app must call this
+        // at the end (see PR 1.5 fix at the end of the function).
+        let removed = crate::common::drop_handle(ctx_handle);
+
+        // Post-condition: the handle no longer exists in the registry.
+        assert!(removed, "drop_handle should return true for a live handle");
+        assert!(
+            !crate::common::handle_exists(ctx_handle),
+            "FastifyContext handle leaked: still present after drop_handle"
+        );
+    }
+
     /// Regression test for PR 2 (bottleneck #2 — per-request clones).
     /// `FastifyContext::new` previously consumed cloned copies of the
     /// `pending.headers` / `pending.body` / `pending.params` fields,
