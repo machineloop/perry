@@ -148,6 +148,17 @@ pub struct Plugin {
 pub struct FastifyApp {
     /// Registered routes
     pub routes: Vec<Route>,
+    /// O(1) index over the subset of `routes` whose pattern has no
+    /// `Param`/`Wildcard` segments. Key format: `"{METHOD} {full_path}"`
+    /// (matching what `match_route` builds at lookup time). Value: the
+    /// index into `self.routes`. Built incrementally in `add_route`;
+    /// parametric routes fall through to the existing linear scan over
+    /// `self.routes`. This is the radix-routing micro-fix from bottleneck
+    /// #3 in .claude/plans/look-at-the-benchmarks-jazzy-llama.md — keeps
+    /// the existing data model (and GC scanner walk over `routes`) intact
+    /// while turning the dominant static-route lookup cost from O(N) per
+    /// request into one HashMap hash + comparison.
+    pub static_index: HashMap<String, usize>,
     /// Lifecycle hooks
     pub hooks: Hooks,
     /// Custom error handler
@@ -195,6 +206,7 @@ impl FastifyApp {
     pub fn new() -> Self {
         Self {
             routes: Vec::new(),
+            static_index: HashMap::new(),
             hooks: Hooks::default(),
             error_handler: None,
             plugins: Vec::new(),
@@ -208,6 +220,7 @@ impl FastifyApp {
     pub fn with_prefix(prefix: String) -> Self {
         Self {
             routes: Vec::new(),
+            static_index: HashMap::new(),
             hooks: Hooks::default(),
             error_handler: None,
             plugins: Vec::new(),
@@ -225,11 +238,46 @@ impl FastifyApp {
             format!("{}{}", self.prefix, path)
         };
 
+        let method_upper = method.to_uppercase();
+        let pattern = RoutePattern::parse(&full_path);
+
+        // If the pattern is fully static (no Param/Wildcard segments),
+        // index it for O(1) lookup. Parametric and wildcard routes still
+        // go through the linear scan in `match_route` below. The key
+        // shape mirrors what `match_route` builds at request time —
+        // `match_route` falls back to linear scan when the static-index
+        // miss is a real miss vs a parametric path.
+        let is_static = pattern
+            .segments
+            .iter()
+            .all(|s| matches!(s, crate::fastify::router::Segment::Static(_)));
+
+        let new_idx = self.routes.len();
         self.routes.push(Route {
-            method: method.to_uppercase(),
-            pattern: RoutePattern::parse(&full_path),
+            method: method_upper,
+            pattern,
             handler,
         });
+        if is_static {
+            // Key shape: `"METHOD /normalized/path"` — leading slash
+            // canonicalized so we can match the lookup-side
+            // normalization in `match_route` below regardless of
+            // whether the user registered "/foo" or "foo".
+            let route = &self.routes[new_idx];
+            let canon_path = if full_path.starts_with('/') {
+                full_path.clone()
+            } else {
+                format!("/{}", full_path)
+            };
+            let key = format!("{} {}", route.method, canon_path);
+            // Last-registration-wins on collisions, matching the
+            // existing linear-scan behaviour where the latest route is
+            // hit first only if it shadows the earlier one's pattern
+            // exactly. Fastify itself errors on exact duplicates but
+            // perry-stdlib has never enforced that — preserve today's
+            // tolerant behavior rather than tighten it inside a perf PR.
+            self.static_index.insert(key, new_idx);
+        }
     }
 
     /// Add a hook
@@ -258,6 +306,35 @@ impl FastifyApp {
         method: &str,
         path: &str,
     ) -> Option<(&Route, HashMap<String, String>)> {
+        // Strip an optional query string before looking up the static
+        // index — `RoutePattern::match_path` does the same on the linear
+        // scan side (router.rs:79). Without this, a request to
+        // `/external_ping?foo=bar` would miss the index entry for the
+        // static `/external_ping` registration even though the linear
+        // scan would correctly match it.
+        let lookup_path = path.split('?').next().unwrap_or(path);
+
+        // Fast path: static (no Param/Wildcard) routes are O(1) via
+        // self.static_index. Key shape matches what `add_route` writes
+        // at registration time: METHOD-uppercased + space + path with
+        // leading slash.
+        let canon_path: String = if lookup_path.starts_with('/') {
+            lookup_path.to_string()
+        } else {
+            format!("/{}", lookup_path)
+        };
+        let key = format!("{} {}", method, canon_path);
+        if let Some(&idx) = self.static_index.get(&key) {
+            let route = &self.routes[idx];
+            // Static routes never extract path params. Returning the
+            // empty HashMap matches `RoutePattern::match_path`'s
+            // behaviour for static patterns (see router.rs:88-92).
+            return Some((route, HashMap::new()));
+        }
+
+        // Slow path: parametric / wildcard routes still go through the
+        // linear scan, preserving the existing first-registered-wins
+        // semantic.
         for route in &self.routes {
             if route.method == method {
                 if let Some(params) = route.pattern.match_path(path) {

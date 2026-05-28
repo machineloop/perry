@@ -2,6 +2,45 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1037 — fastify: index static routes for O(1) lookup
+
+`FastifyApp::match_route` in `crates/perry-stdlib/src/fastify/mod.rs`
+linearly scanned `self.routes` per request, calling
+`RoutePattern::match_path` on each route until a hit. For an app
+with N routes the cost was O(N) per request — most yammer-web-server
+routes are static (no Param/Wildcard) and can be matched in O(1)
+by hashing the (method, path) pair.
+
+Add a `static_index: HashMap<String, usize>` field on `FastifyApp`.
+`add_route` inspects the parsed pattern; if every segment is
+`RoutePattern::Segment::Static`, it inserts `"{METHOD} {full_path}"`
+→ `routes.len()-1` into the index. `match_route` checks the index
+first; on a miss it falls back to the existing linear scan, which
+preserves first-registration-wins semantics for parametric overlap.
+The data model is unchanged — routes still live in `routes:
+Vec<Route>` and the GC scanner still walks them — so the change is
+purely additive and safe under PR 5's planned slab consolidation.
+
+### Validation
+
+- Two new regression tests in `router.rs`:
+  - `test_static_index_population_and_lookup`
+  - `test_static_index_respects_prefix`
+- `cargo test --release -p perry-stdlib fastify`: 26/26 passing
+  (was 24 — added 2 tests).
+- Real-app yammer-web-server `/external_ping` 5×15s at -c 10:
+  - PR 2 (v0.5.1036) = 2891.2 rps / p99 6.68 ms
+  - PR 3 (this) = **2914.0 rps / p99 6.62 ms** — +0.8% rps,
+    ~1% lower p99 vs PR 2. Vs README (10.8 rps / 1003 ms) =
+    270× rps, 151× lower p99.
+
+Modest delta on this route because `/external_ping` is the first
+route registered in PerryTs and the pre-existing linear scan
+found it in ~1 comparison. The static-index payoff materializes
+on later-registered routes (e.g. yammer's plugin-scoped
+`/api/v1/...` arrives after 20+ earlier registrations). Those
+aren't in the published 4-route hot set.
+
 ## v0.5.1036 — fastify: replace per-request HashMap/Vec clones with mem::take moves
 
 `process_fastify_request_with_app` in

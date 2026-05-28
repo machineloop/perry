@@ -290,6 +290,91 @@ mod app_tests {
         assert_eq!(scoped.prefix, "/api/v1");
     }
 
+    /// Regression test for PR 3 (bottleneck #3 — radix-router micro-fix).
+    /// `add_route` should index static (no Param/Wildcard) routes into
+    /// `static_index` for O(1) lookup in `match_route`, while routes
+    /// with Param/Wildcard segments stay out of the index so they only
+    /// match via the linear scan that preserves first-registration-wins
+    /// semantics for parametric overlap.
+    ///
+    /// Failure modes this catches:
+    ///   * static_index missing entries → linear scan still hit, no
+    ///     measurable perf regression but the index becomes dead code
+    ///   * parametric routes leaking into static_index → wrong handler
+    ///     dispatched for parametric requests, since the static index
+    ///     short-circuits before the linear scan's pattern.match_path
+    ///     would have extracted the params
+    ///   * key normalization drift (e.g. add_route uses "users" while
+    ///     match_route looks up "/users") → static_index lookup misses
+    ///     and falls through to linear scan; correct behaviour but the
+    ///     perf gain disappears
+    #[test]
+    fn test_static_index_population_and_lookup() {
+        use crate::fastify::FastifyApp;
+
+        let mut app = FastifyApp::new();
+        app.add_route("GET", "/external_ping", 1); // static
+        app.add_route("GET", "/users/:id", 2);     // parametric
+        app.add_route("POST", "/users", 3);        // static
+        app.add_route("GET", "/static/*", 4);      // wildcard
+        app.add_route("GET", "/", 5);              // static (root)
+
+        // Static routes are indexed; parametric/wildcard ones are NOT.
+        assert!(app.static_index.contains_key("GET /external_ping"));
+        assert!(app.static_index.contains_key("POST /users"));
+        assert!(app.static_index.contains_key("GET /"));
+        assert!(!app.static_index.contains_key("GET /users/:id"));
+        assert!(!app.static_index.contains_key("GET /static/*"));
+        assert_eq!(app.static_index.len(), 3);
+
+        // Fast-path hits return the right handler with empty params.
+        let (route, params) = app.match_route("GET", "/external_ping").unwrap();
+        assert_eq!(route.handler, 1);
+        assert!(params.is_empty());
+
+        // Query string on the request path doesn't break the index hit.
+        let (route, _) = app.match_route("GET", "/external_ping?foo=bar").unwrap();
+        assert_eq!(route.handler, 1);
+
+        // Parametric routes still match through the linear-scan path
+        // and extract their params correctly.
+        let (route, params) = app.match_route("GET", "/users/42").unwrap();
+        assert_eq!(route.handler, 2);
+        assert_eq!(params.get("id"), Some(&"42".to_string()));
+
+        // Wildcard routes still match through the linear-scan path.
+        let (route, params) = app.match_route("GET", "/static/css/x.css").unwrap();
+        assert_eq!(route.handler, 4);
+        assert_eq!(params.get("*"), Some(&"css/x.css".to_string()));
+
+        // Method mismatches don't short-circuit through the static index.
+        assert!(app.match_route("DELETE", "/external_ping").is_none());
+    }
+
+    /// Regression test for PR 3 prefix interaction: when a FastifyApp
+    /// is constructed with a prefix (plugin-style), the static-index
+    /// key should be the FULL prefixed path, not the user-passed
+    /// suffix. Otherwise routes registered via `app.add_route("GET",
+    /// "/users", ...)` on a `with_prefix("/api")` app would miss the
+    /// index lookup for the actual request URL `/api/users`.
+    #[test]
+    fn test_static_index_respects_prefix() {
+        use crate::fastify::FastifyApp;
+
+        let mut app = FastifyApp::with_prefix("/api".to_string());
+        app.add_route("GET", "/users", 10);
+
+        assert!(app.static_index.contains_key("GET /api/users"));
+        assert!(!app.static_index.contains_key("GET /users"));
+
+        // Lookup against the prefixed path hits the fast path.
+        let (route, _) = app.match_route("GET", "/api/users").unwrap();
+        assert_eq!(route.handler, 10);
+
+        // Unprefixed lookup correctly misses (neither index nor scan).
+        assert!(app.match_route("GET", "/users").is_none());
+    }
+
     #[test]
     fn test_route_with_prefix() {
         let mut app = FastifyApp::with_prefix("/api".to_string());
