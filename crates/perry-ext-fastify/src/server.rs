@@ -229,6 +229,11 @@ pub unsafe extern "C" fn js_fastify_listen(app_handle: Handle, opts: f64, callba
     // Extract port — accepts `{ port: 3000 }`, a bare number, or
     // falls back to 3000.
     let port = extract_port(opts);
+    // #cluster — SO_REUSEPORT lets multiple processes (cluster workers) bind
+    // the same port; the kernel load-balances accepts. Enable when the app
+    // passes `{ reusePort: true }` OR when this process is a cluster worker
+    // (NODE_UNIQUE_ID set), so clustering works with no app-side change.
+    let reuse_port = extract_reuse_port(opts) || std::env::var("NODE_UNIQUE_ID").is_ok();
 
     let (request_tx, request_rx) = mpsc::channel::<FastifyPendingRequest>(1024);
     // #1113 — separate channel for WebSocket upgrade events so a busy
@@ -264,7 +269,7 @@ pub unsafe extern "C" fn js_fastify_listen(app_handle: Handle, opts: f64, callba
         let handle = tokio::runtime::Handle::current();
         handle.block_on(async move {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            let listener = match TcpListener::bind(addr).await {
+            let listener = match build_listener(addr, reuse_port) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Failed to bind to port {}: {}", port, e);
@@ -1329,6 +1334,49 @@ unsafe fn extract_port(opts: f64) -> u16 {
         }
     }
     3000
+}
+
+/// Read `reusePort: true` from a `{ port, reusePort }` listen-options object.
+/// Defaults to false for a bare-number or missing option.
+unsafe fn extract_reuse_port(opts: f64) -> bool {
+    let v = JsValue::from_bits(opts.to_bits());
+    if v.is_pointer() {
+        if let Some(json) = perry_ffi::json_stringify(v) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
+                return parsed
+                    .get("reusePort")
+                    .and_then(|p| p.as_bool())
+                    .unwrap_or(false);
+            }
+        }
+    }
+    false
+}
+
+/// Build the accept socket. `SO_REUSEADDR` is always set (fast restart);
+/// `SO_REUSEPORT` is set when `reuse_port` is true so multiple processes
+/// (cluster workers) can bind the same port and the kernel load-balances
+/// accepts. Mirrors the std-listener → `TcpListener::from_std` adoption used
+/// by perry-ext-http-server. Must run inside a tokio runtime context.
+fn build_listener(addr: SocketAddr, reuse_port: bool) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    if reuse_port {
+        sock.set_reuse_port(true)?;
+    }
+    #[cfg(not(unix))]
+    let _ = reuse_port;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    sock.set_nonblocking(true)?;
+    TcpListener::from_std(sock.into())
 }
 
 // `js_promise_reason` is declared so wrappers that want to surface

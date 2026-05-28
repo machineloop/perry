@@ -48,6 +48,31 @@ use tokio::sync::{mpsc, oneshot};
 
 use tokio_rustls::client::TlsStream;
 
+/// Build a TCP accept socket with SO_REUSEADDR, plus SO_REUSEPORT when
+/// `reuse_port` is set so multiple cluster-worker processes can share one
+/// port (the kernel load-balances accepts). Mirrors perry-ext-fastify's
+/// `build_listener`. Must run inside a tokio runtime context.
+fn build_listener(addr: SocketAddr, reuse_port: bool) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    if reuse_port {
+        sock.set_reuse_port(true)?;
+    }
+    #[cfg(not(unix))]
+    let _ = reuse_port;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    sock.set_nonblocking(true)?;
+    TcpListener::from_std(sock.into())
+}
+
 // #1852 — topical sub-modules split out to keep this file under the
 // 2000-line size gate. `tls` holds the rustls config + handshake; `ip`
 // holds the `net.isIP*` + auto-select-family helpers.
@@ -814,6 +839,9 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, callback_i
 
     let host_for_spawn = host.clone();
     let server_id = handle;
+    // #cluster — share the port across cluster workers via SO_REUSEPORT when
+    // running as a worker (NODE_UNIQUE_ID set). bool is Copy → captured below.
+    let reuse_port = std::env::var("NODE_UNIQUE_ID").is_ok();
 
     // Schedule the accept loop on the multi-thread tokio runtime that
     // perry-stdlib hosts. Mirrors `js_node_http_server_listen`'s
@@ -833,7 +861,10 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, callback_i
         let rt = tokio::runtime::Handle::current();
         let jh = rt.spawn(async move {
             let bind_str = format!("{}:{}", host_for_spawn, port_u16);
-            let listener = match TcpListener::bind(&bind_str).await {
+            let bind_addr: SocketAddr = bind_str
+                .parse()
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port_u16)));
+            let listener = match build_listener(bind_addr, reuse_port) {
                 Ok(l) => l,
                 Err(e) => {
                     push_event(PendingNetEvent::ServerError(
