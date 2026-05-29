@@ -2,6 +2,23 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1048 — fastify(stdlib): SO_REUSEPORT for `node:cluster` workers
+
+Port the `SO_REUSEPORT` listener-construction path from `perry-ext-fastify/src/server.rs` into the bundled `perry-stdlib::fastify::server::js_fastify_listen`. When the process is a `node:cluster` worker (`NODE_UNIQUE_ID` set in env by `cluster.fork()`), the accept socket is now built via `socket2::Socket` with `set_reuse_port(true)` before `bind`/`listen` so every worker can hold its own listening socket on the same port and the kernel load-balances accepts across them. Single-process callers (no `NODE_UNIQUE_ID`) keep the existing `tokio::net::TcpListener::bind` behaviour byte-for-byte.
+
+- **Symptom**: yammer-web-server's PerryTs port set `PERRYTS_WORKERS=32`; 32 worker processes spawned and registered with the primary's reactor, but `/proc/net/tcp` showed exactly *one* listener on port 10800. The other 31 workers booted, sat in `futex_wait_queue`, and never served traffic. Throughput plateaued at ~10 K rps regardless of worker count.
+- **Root cause**: the `perryts-yws` binary contains `perry_stdlib::fastify::server::js_fastify_listen` (verified via `nm`), not `perry_ext_fastify`. That stdlib path called plain `tokio::net::TcpListener::bind(addr)` — no `SO_REUSEPORT`. Subsequent workers' `bind()` either failed silently into a buffered stderr pipe the primary's reactor doesn't drain, or got stuck on a tokio runtime init resource the first worker held.
+- **Fix**: new `build_listener(addr, reuse_port)` helper in `crates/perry-stdlib/src/fastify/server.rs` mirrors the perry-ext-fastify path exactly: `socket2::Socket::new` → `set_reuse_address(true)` → `set_reuse_port(true)` (gated on `NODE_UNIQUE_ID` presence) → `bind` → `listen(1024)` → `set_nonblocking(true)` → `tokio::net::TcpListener::from_std`. `Cargo.toml` adds `socket2 = "0.6"` (optional) and pulls it into both the `bundled-fastify` and `http-server` feature gates.
+- **Verification**: `cargo test --release -p perry-stdlib fastify` 31/31 passing. Real-app yammer-web-server bench with `PERRYTS_WORKERS=32`, run from inside the container at `-c 1024`, 5 × 15 s per route:
+    - listener count on port 10800: 1 → **32** (verified via `/proc/net/tcp`)
+    - /external_ping: 4 505 → **124 682 rps** (27.7×), p99 5 ms → 22 ms
+    - /yammer:        3 384 → **65 981 rps** (19.5×), p99 6.5 ms → 39 ms
+    - /sw.js:         2 652 → **37 585 rps** (14.2×), p99 6.8 ms → 54 ms
+    - /teamsmeeting:  3 489 → **78 748 rps** (22.6×), p99 5.4 ms → 33 ms
+  All 32 workers at 27–45 % CPU under sustained `-c 1024` load (top inside the container), confirming kernel `SO_REUSEPORT` distribution is fair. Findings + raw oha JSON archived at `yammer-web-server/benchmarks/results/perry-cluster32/`.
+
+Refs: `perry-ext-fastify/src/server.rs:1361` `build_listener` (the reference implementation we mirrored); `feat(net): honor SO_REUSEPORT in fastify + net listen for cluster port sharing` (v0.5.1046, the analogous `perry-ext-net` SO_REUSEPORT path for raw `node:net.createServer` users).
+
 ## v0.5.1047 — runtime: strict `is_valid_obj_ptr` (close two SIGSEGV sites in object setters)
 
 Tighten `is_valid_obj_ptr` in `crates/perry-runtime/src/object/mod.rs` to consult the arena's `classify_heap_generation` registry: addresses outside any registered heap block now return `HeapGeneration::Unknown` and are rejected before any GC-header dereference. Pre-fix the helper accepted any address in the plausibly-userspace range `(0x1000..0x8000_0000_0000)` — including unmapped pages whose backing arena blocks had been recycled — and the typed-feedback fast path `js_typed_feedback_object_set_field_by_name_fast` would deref a stale pointer (`movzbl -0x8(%rax), %ecx`) and crash.

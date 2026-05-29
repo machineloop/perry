@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -93,6 +94,34 @@ pub struct FastifyResponse {
     pub body: Vec<u8>,
 }
 
+/// Build the accept socket. `SO_REUSEADDR` is always set so a restart
+/// can re-bind a TIME_WAIT port; `SO_REUSEPORT` is set when the caller
+/// is a `node:cluster` worker so multiple processes can share the port
+/// and the kernel load-balances accepts across them. Mirrors
+/// perry-ext-fastify's listener path so behaviour is identical whether
+/// the well-known flip routes `import 'fastify'` to perry-stdlib's
+/// bundled fastify or to perry-ext-fastify. Must run inside a tokio
+/// runtime context (uses `TcpListener::from_std`).
+fn build_listener(addr: SocketAddr, reuse_port: bool) -> std::io::Result<TcpListener> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(unix)]
+    if reuse_port {
+        sock.set_reuse_port(true)?;
+    }
+    #[cfg(not(unix))]
+    let _ = reuse_port;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    sock.set_nonblocking(true)?;
+    TcpListener::from_std(sock.into())
+}
+
 /// Start the server and begin listening
 #[no_mangle]
 pub unsafe extern "C" fn js_fastify_listen(app_handle: Handle, opts: f64, callback: i64) {
@@ -139,12 +168,22 @@ pub unsafe extern "C" fn js_fastify_listen(app_handle: Handle, opts: f64, callba
     // the main thread, with closure slots covered by the Fastify root
     // scanner, so this listener lifetime must not suppress GC.
 
+    // #cluster — when this process is a `node:cluster` worker (the
+    // primary stamped `NODE_UNIQUE_ID` into our env via `cluster.fork`),
+    // bind with SO_REUSEPORT so every worker can hold its own listening
+    // socket on the same port and the kernel load-balances accepts
+    // across them. Without this, the first worker wins `bind(2)` and
+    // every subsequent worker fails EADDRINUSE — the rest of the
+    // cluster forks but never serves traffic. Primary / single-process
+    // path stays on plain tokio bind for byte-identical behaviour.
+    let reuse_port = std::env::var("NODE_UNIQUE_ID").is_ok();
+
     // Spawn the server
     let routes_for_spawn = routes_arc.clone();
     RUNTIME.spawn(async move {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-        let listener = match TcpListener::bind(addr).await {
+        let listener = match build_listener(addr, reuse_port) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("Failed to bind to port {}: {}", port, e);
@@ -599,6 +638,62 @@ pub fn js_fastify_process_pending() -> i32 {
             };
             process_fastify_request(app_handle, pending);
             count += 1;
+
+            // PR 1.5+ diagnosis: every 1000 requests, dump handle count
+            // + thread-local DEFERRED size to stderr so we can see whether
+            // either is growing unboundedly under sustained load. Gated
+            // by env var to avoid log spam in normal use.
+            // Cache the env-var check via OnceLock so we don't allocate
+            // a String per request inside `std::env::var`. The diag is
+            // off by default and the cached bool short-circuits the
+            // disabled path to a single atomic load.
+            static LEAK_DIAG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let diag_enabled = *LEAK_DIAG_ENABLED
+                .get_or_init(|| std::env::var("PERRY_FASTIFY_LEAK_DIAG").is_ok());
+            if diag_enabled {
+                thread_local! {
+                    static DIAG_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+                }
+                let n = DIAG_COUNTER.with(|c| {
+                    let v = c.get().wrapping_add(1);
+                    c.set(v);
+                    v
+                });
+                if n % 1000 == 0 {
+                    let hc = crate::common::js_handle_count();
+                    let deferred = DEFERRED.with(|q| q.borrow().len());
+                    let rss = std::fs::read_to_string("/proc/self/status")
+                        .ok()
+                        .and_then(|s| {
+                            s.lines()
+                                .find(|l| l.starts_with("VmRSS:"))
+                                .map(|l| l.trim().to_string())
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    let force_gc = std::env::var("PERRY_FASTIFY_FORCE_GC").is_ok();
+                    if force_gc {
+                        extern "C" {
+                            fn js_gc_collect();
+                        }
+                        unsafe { js_gc_collect() };
+                        let rss_after = std::fs::read_to_string("/proc/self/status")
+                            .ok()
+                            .and_then(|s| {
+                                s.lines()
+                                    .find(|l| l.starts_with("VmRSS:"))
+                                    .map(|l| l.trim().to_string())
+                            })
+                            .unwrap_or_else(|| "?".to_string());
+                        eprintln!(
+                            "[fastify-leak-diag] requests={n} handles={hc} deferred_q={deferred} {rss} -> after gc: {rss_after}"
+                        );
+                    } else {
+                        eprintln!(
+                            "[fastify-leak-diag] requests={n} handles={hc} deferred_q={deferred} {rss}"
+                        );
+                    }
+                }
+            }
         }
     }
 

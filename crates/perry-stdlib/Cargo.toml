@@ -72,8 +72,8 @@ bundled-commander = []
 # `framework` module stays on `http-server` directly so it remains
 # available for non-fastify hyper users; perry-ext-fastify ships
 # its own self-contained surface.
-http-server = ["bundled-fastify", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "async-runtime"]
-bundled-fastify = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "async-runtime"]
+http-server = ["bundled-fastify", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:socket2", "async-runtime"]
+bundled-fastify = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:socket2", "async-runtime"]
 
 # HTTP client (node-fetch, axios) — single umbrella for both. The
 # well-known flip strips this when the user imports either module
@@ -302,6 +302,12 @@ hyper = { version = "1.4", features = ["server", "http1", "http2"], optional = t
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1.5", optional = true }
+# socket2 — gives us SO_REUSEPORT so a cluster of perryts workers can
+# bind the same port and the kernel load-balances accepts across them
+# (`node:cluster.fork()` + Perry's `NODE_UNIQUE_ID` convention). Mirrors
+# perry-ext-fastify's listener path so the bundled fastify behaves the
+# same under clustering as the external one.
+socket2 = { version = "0.6", optional = true }
 # DashMap is used by the always-on handle registry (`common/handle.rs`),
 # so it must NOT be optional — every minimal-stdlib build needs it.
 dashmap = "6.2"
