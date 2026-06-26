@@ -81,6 +81,10 @@ use raw_bridge::RawReadState;
 // validator `extern` declarations are imported for the listen/connect sites.
 mod adopt;
 pub use adopt::{adopt_upgraded_tcp_stream, ensure_adopted_socket_dispatch};
+// #4914 — `node:cluster` worker port sharing: bind the `net.Server` accept
+// socket with SO_REUSEPORT when running as a `cluster.fork()` worker, mirroring
+// the HTTP listen sites (perry-ext-http-server's `cluster_bind`).
+mod cluster_bind;
 mod option_setters;
 pub use option_setters::{
     js_net_server_noop_self, js_net_socket_get_type_of_service, js_net_socket_noop_self,
@@ -744,7 +748,20 @@ pub unsafe extern "C" fn js_net_server_listen(handle: i64, port: f64, arg2: f64,
     // `js_ext_net_has_active_handles` keeps the loop alive until `close()`.
     perry_ffi::spawn_async(async move {
         let bind_str = format!("{}:{}", host_for_spawn, port_u16);
-        let listener = match TcpListener::bind(&bind_str).await {
+        // #4914 — bind through `cluster_bind` so a `cluster.fork()` worker
+        // (NODE_UNIQUE_ID set) shares the port via SO_REUSEPORT and the kernel
+        // load-balances accepts across workers; a non-worker process keeps the
+        // plain bind. `bind_listener` returns a std socket, so adopt it into the
+        // tokio accept loop via `set_nonblocking(true)` + `from_std`. (`host`
+        // is the wildcard today; parse defensively with a wildcard fallback.)
+        let bind_addr: SocketAddr = bind_str
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port_u16)));
+        let listener = match (|| -> std::io::Result<TcpListener> {
+            let std_listener = cluster_bind::bind_listener(bind_addr)?;
+            std_listener.set_nonblocking(true)?;
+            TcpListener::from_std(std_listener)
+        })() {
             Ok(l) => l,
             Err(e) => {
                 push_event(PendingNetEvent::ServerError(

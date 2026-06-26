@@ -5802,6 +5802,7 @@ dependencies = [
  "perry-runtime",
  "rustls",
  "rustls-native-certs",
+ "socket2",
  "tokio",
  "tokio-rustls",
 ]

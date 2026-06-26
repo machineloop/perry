@@ -21,6 +21,12 @@ tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-native-certs = "0.8"
 
+# #4914 — SO_REUSEPORT so `cluster.fork()` workers share one `net.Server`
+# listen port (kernel load-balances accepts). Unix-only, matching the HTTP
+# listen sites (perry-ext-http-server). Already in the workspace lock.
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
+
 [dev-dependencies]
 perry-ffi = { workspace = true, features = ["runtime-link"] }
 perry-runtime.workspace = true
