@@ -349,6 +349,13 @@ pub(crate) fn is_global_this_builtin_name(name: &str) -> bool {
             | "setImmediate"
             | "clearImmediate"
             | "queueMicrotask"
+            // The `gc()` builtin, exposed as a real callable on globalThis.
+            // Recognizing it here makes a bare `gc` VALUE read resolve to the
+            // installed `globalThis.gc` closure (via the value-materialization
+            // gate in dyn_extern_i18n.rs) instead of falling back to the
+            // TAG_TRUE boolean sentinel — so `const f = gc; f()` and
+            // `typeof gc === "function"` work, matching setTimeout.
+            | "gc"
             // #2905: standard global helper functions (typeof === "function").
             | "parseInt"
             | "parseFloat"
